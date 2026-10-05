@@ -1,0 +1,5 @@
+{
+  "name": "toa-sheet",
+  "description": "A pixel-art character sheet pane beside the transcript, fed by the Tomb of Annihilation rules connector's sheet_read and sheet_write results",
+  "author": { "name": "NullDefault" }
+}

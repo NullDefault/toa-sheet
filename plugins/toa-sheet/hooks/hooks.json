@@ -1,0 +1,4 @@
+{
+  "description": "toa-sheet: the character sheet pane",
+  "modules": ["./register.ts"]
+}

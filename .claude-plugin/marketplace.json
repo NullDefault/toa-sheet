@@ -1,0 +1,12 @@
+{
+  "name": "toa",
+  "description": "Tomb of Annihilation table tools",
+  "owner": { "name": "NullDefault" },
+  "plugins": [
+    {
+      "name": "toa-sheet",
+      "source": "./plugins/toa-sheet",
+      "description": "Your character sheet in a pane beside the chat: HP, AC, spell DCs, slots and a turn menu. Open it with /sheet."
+    }
+  ]
+}
