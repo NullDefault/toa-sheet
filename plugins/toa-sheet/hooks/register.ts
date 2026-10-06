@@ -5,7 +5,7 @@
 // itself: whether a mod can (step 0) is recorded in the README.
 //
 // Mods API calls: $.ui, $.store, $.command, $.clock only. Every call lives in
-// this file; sheet.ts, art.ts and view.ts are pure.
+// this file; sheet.ts, look.ts and view.ts are pure.
 
 import type { EngineInterface, On, RenderElement } from 'claude-code'
 import { asApplied, asGet, entryAfterWrite, entryFromGet, matchEntry, payloadOf, type Entry } from './sheet.ts'
@@ -22,7 +22,6 @@ let tab: TabId = 'actions'
 // The pane's Buttons from each surface's last drawing, handed back unchanged so
 // their press handles survive a redraw (view.ts, PaneView.memo).
 const memos = new Map<string, Map<string, RenderElement>>()
-let probed = '' // the last pane geometry written to the store, so it is written only when it changes
 let paneOpen = false
 let dismissed = false // the user closed the pane: do not open it unasked again this session
 let autoTried = false
@@ -153,24 +152,6 @@ export function register(on: On) {
     const memo = memos.get(e.surface) ?? new Map<string, RenderElement>()
     memos.set(e.surface, memo)
     const now = await $.clock.now()
-    // Probe: what each surface reports about the pane, kept in the store as `probe:pane:<surface>`
-    // to size the art from (README, Design). Fire and forget: a refusal must not cost the drawing.
-    const probe = { bodyColumns: e.props?.bodyColumns, viewport: e.viewport, scroll: e.props?.scroll, placement: e.props?.placement, surface: e.surface }
-    const seen = JSON.stringify(probe)
-    if (seen !== probed) {
-      probed = seen
-      const record = { ...probe, at: now }
-      try {
-        $.store.set('probe:pane:' + e.surface, record).catch(() => {
-          // Refused while drawing: write it just after instead.
-          try {
-            $.clock.after(0, () => {
-              $.store.set('probe:pane:' + e.surface, record).catch(() => {})
-            })
-          } catch {}
-        })
-      } catch {}
-    }
     return paneTree(el, { entry: focused(), surface: e.surface, columns: e.props?.bodyColumns ?? 40, tab, memo, now })
   })
 
@@ -190,6 +171,6 @@ export function register(on: On) {
     const entry = focused()
     if (paneOpen || !seenHere || !entry) return next(e)
     const el = $.ui.resolve(e)
-    return el.Box({ flexDirection: 'column', children: [bandTree(el, entry), await next(e)] })
+    return el.Box({ flexDirection: 'column', children: [bandTree(el, entry, e.surface), await next(e)] })
   })
 }
