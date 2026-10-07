@@ -39,6 +39,8 @@ export interface Entry {
   /** Loaded from the store, written by an earlier session. */
   fromStore: boolean
   last: Change | null
+  /** The last `sheet_read check` of this sheet, counts only (the findings stay in the transcript). */
+  check?: { at: number; version: number; warnings: number; infos: number }
 }
 
 type Payload = { data: unknown } | { error: string }
@@ -51,7 +53,8 @@ function parseText(text: string): Payload | null {
   }
 }
 
-function textOf(v: unknown): string {
+/** A result's text as the model read it: a string, or content blocks joined. */
+export function textOf(v: unknown): string {
   if (typeof v === 'string') return v
   if (Array.isArray(v)) return v.map(textOf).join('')
   if (v && typeof v === 'object') {
@@ -68,8 +71,8 @@ function textOf(v: unknown): string {
  * A tool result unwrapped to the server's JSON. From a tool.call hook's
  * `next(e)` Claude Code (2.1.288 types) gives `{ ref, result, text }`, `text`
  * being the result as the model reads it, with `isError` on a failure; from
- * `$.mcp.call`, MCP's own `{ content, isError }`. The shape checks below decide
- * whether the JSON is ours.
+ * `$.tool.call`, the same shape; MCP's own `{ content, isError }` also parses.
+ * The shape checks below decide whether the JSON is ours.
  */
 export function payloadOf(result: unknown): Payload | null {
   if (result === null || result === undefined) return null
@@ -123,7 +126,26 @@ export function asApplied(d: unknown): AppliedPayload | null {
   return { character: d.character, name: typeof d.name === 'string' ? d.name : undefined, version: d.version, diff: d.diff }
 }
 
-export function entryFromGet(g: GetPayload, server: string, now: number): Entry {
+export interface Finding {
+  severity: string
+  message: string
+  citation?: unknown
+}
+
+export interface CheckPayload {
+  character: { id: string; version: number }
+  findings: Finding[]
+}
+
+/** A `sheet_read check` answer, or null when the payload is anything else. */
+export function asCheck(d: unknown): CheckPayload | null {
+  if (!isObj(d) || !isObj(d.character) || typeof d.character.id !== 'string' || !Number.isInteger(d.character.version)) return null
+  if (!Array.isArray(d.findings) || !d.findings.every((f: unknown) => isObj(f) && typeof f.severity === 'string' && typeof f.message === 'string')) return null
+  return { character: d.character as CheckPayload['character'], findings: d.findings }
+}
+
+/** `check` is the cached entry's, carried over: a get does not re-check. */
+export function entryFromGet(g: GetPayload, server: string, now: number, check?: Entry['check']): Entry {
   return {
     id: g.character.id,
     name: g.sheet.name,
@@ -139,6 +161,7 @@ export function entryFromGet(g: GetPayload, server: string, now: number): Entry 
     derivedPending: false,
     fromStore: false,
     last: null,
+    ...(check ? { check } : {}),
   }
 }
 

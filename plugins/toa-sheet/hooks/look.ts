@@ -24,6 +24,21 @@ export const TOKENS = {
   faint: '#6a6a6a',
 } as const
 
+/**
+ * A receipt's indent in the transcript: the engine's rows carry a `⏺` and two
+ * columns of indent, a hook's row carries no bullet, so the verb sits in the
+ * text column (probe run 5 showed the detail at column 0 beside an indented
+ * engine block).
+ */
+export const RECEIPT_INDENT = 2
+
+/**
+ * How long a changed value stays inverse after a write. Handoff 17: "one
+ * 'flash' frame on a changed value (step C: redraw it inverse once, then
+ * normal)."
+ */
+export const FLASH_MS = 800
+
 /** One glyph pair for every gauge. `▮`/`▯` wait for a live check of the players' fonts. */
 export const GAUGE = { full: '█', spent: '░' } as const
 

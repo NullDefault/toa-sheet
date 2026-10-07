@@ -106,16 +106,17 @@ export function cellsSvg(segs: Segment[], tone: Tone, cw: number, ch: number, al
 
 /**
  * The HP instrument: the current HP at 4× in the state's colour (knocked out,
- * void on an alert plate, under a quarter), `/max` dim at 2× on its baseline,
- * temp cyan, then the gauge centred beside it. Always 36 CSS px high.
+ * void on a plate of that colour under a quarter or while `flash`), `/max` dim
+ * at 2× on its baseline, temp cyan, then the gauge centred beside it. Always
+ * 36 CSS px high.
  */
-export function hpSvg(current: number, max: number, temp: number, state: HpState): Art {
+export function hpSvg(current: number, max: number, temp: number, state: HpState, opts: { flash?: boolean } = {}): Art {
   const p = painter()
   const cur = String(current)
   const heroW = textWidth(cur) * 4
   let x: number
-  if (state === 'alert') {
-    p.rect(0, 0, heroW + 8, 36, TOKENS.alert)
+  if (opts.flash || state === 'alert') {
+    p.rect(0, 0, heroW + 8, 36, TOKENS[state])
     p.text(cur, 4, 4, 4, SVG.void)
     x = heroW + 10
   } else {

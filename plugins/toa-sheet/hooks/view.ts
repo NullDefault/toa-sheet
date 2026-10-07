@@ -8,17 +8,26 @@
 //   INIT · SPD, spell DC and attack per caster, slots, resources;
 // - one row of tabs, one open at a time, by the player's question: actions
 //   (what do I roll?), saves and skills, features, gear, notes;
-// - a faint readout at the bottom: how fresh the numbers are.
+// - faint readouts at the bottom: how fresh the numbers are, and the last check.
 // It draws with look.ts: readout rules between sections, uppercase readouts,
 // values in ink, gauges as glyph runs. One tree, two gauge drawings: the
 // terminal draws the gauges as glyph runs, the surfaces that have `Svg` draw
 // them, and the HP numerals, as pixel instruments (pixel.ts), never a word.
 // The surface is read only by `tabProps` and the gauge sites.
+//
+// The party view (`/party`, the DM's) is a second tree in the same pane: a row
+// per cached sheet, the Table log as seen here, the session, the re-read. While
+// a fight is on (fight.ts), its order is drawn above the party; the entry line
+// the DM types it in sits at the bottom.
 
 import type { ButtonProps, Elements, RenderElement, RenderNode, TextProps } from 'claude-code'
+import { actionGroups, type ActionRow } from './actions.ts'
+import { GRAMMAR, live, orderRows, statusText, type Fight, type Member, type Row } from './fight.ts'
 import { describeChange, type Entry } from './sheet.ts'
-import { bandSegments, gaugeRuns, hpSegments, hpState, pipRuns, rule, TOKENS, type Run, type Segment, type Tone } from './look.ts'
+import { bandSegments, gaugeRuns, hpSegments, hpState, pipRuns, RECEIPT_INDENT, rule, TOKENS, type Run, type Segment, type Tone } from './look.ts'
 import { cellsSvg, hpSvg, pipsSvg, type Art } from './pixel.ts'
+import type { Receipt } from './receipt.ts'
+import { stale, type TableLog } from './table.ts'
 
 /** What `$.ui.resolve(e)` hands out, on any surface. */
 export type Els = Elements[keyof Elements]
@@ -46,7 +55,17 @@ export function tabOf(word: string): TabId | null {
 export const RULES_KEY = 'dm-rules'
 export const tabKey = (id: TabId) => 'tab-' + id
 
+/** The last re-read: `sheets` the gets that answered, `listed` the list answer's length. Module state, never stored. */
+export type Reread = { at: number; sheets: number; listed: number } | { refused: string } | { failed: string }
+
 export interface PaneView {
+  view: 'sheet' | 'party'
+  /** Every cached sheet, in roster order. */
+  rows: Entry[]
+  /** The session's Table log as seen here, or null. */
+  log: TableLog | null
+  session: string | null
+  reread: Reread | null
   entry: Entry | null
   surface: string
   columns: number
@@ -59,6 +78,14 @@ export interface PaneView {
    * (each new Button gets a new handle, and the old one is retired).
    */
   memo: Map<string, RenderElement>
+  /** The diff paths of the last applied write, while its flash lasts; else null. */
+  flash: string[] | null
+  /** The DM's fight, or null; drawn on the party view until it ends. */
+  fight: Fight | null
+  /** The entry line's text as typed, so a redraw keeps a half-typed line. */
+  typed: string
+  /** Why the last typed line was refused, until a line applies. */
+  refused: string | null
 }
 
 const signed = (n: unknown) => (typeof n === 'number' ? (n >= 0 ? '+' + n : String(n)) : '?')
@@ -155,7 +182,7 @@ function otherSpeeds(s: any): string[] {
  * when the sheet was read, not by which session read it, so a module reload
  * changes nothing. The change itself stays as written.
  */
-function freshness(e: Entry, now: number): string {
+export function freshness(e: Entry, now: number): string {
   const pend = e.derivedPending ? ' · NUMBERS MARKED ? MAY CHANGE' : ''
   if (e.refreshing) return `CHANGED ${clock(e.seenAt)} · NOT RE-READ` + (e.last ? ' · ' + describeChange(e.last, e.sheet) : '') + pend
   return (sameDay(e.readAt, now) ? `READ ${clock(e.readAt)}` : `LAST KNOWN · ${day(e.readAt)}`) + pend
@@ -197,8 +224,9 @@ const heading = (el: Base, label: string, extra: RenderNode[] = []) =>
   el.Box({ flexDirection: 'row', columnGap: 2, children: [dim(el, label.toUpperCase()), ...extra] })
 /** A section of a tab: its heading, then its lines, no space between. */
 const section = (el: Base, head: RenderNode, lines: RenderNode[]) => col(el, [head, ...lines])
-/** A number that may change on the next read: amber with a `?`. Otherwise bold ink. */
-const value = (el: Base, s: string, pending = false) => (pending ? text(el, s + '?', { color: TOKENS.amber }) : text(el, s, { bold: true }))
+/** A number that may change on the next read: amber with a `?`. Otherwise bold ink. Inverse while it flashes. */
+const value = (el: Base, s: string, pending = false, flash = false) =>
+  text(el, pending ? s + '?' : s, { ...(pending ? { color: TOKENS.amber } : { bold: true }), ...(flash ? { inverse: true } : {}) })
 const stat = (el: Base, label: string, s: string, pending = false) => row(el, [dim(el, label), value(el, s, pending)])
 
 /** Does nothing: register.ts's `ui.press` hook acts on every press, with a fresh `$`. */
@@ -241,67 +269,67 @@ export function tabProps(surface: string, tab: TabId) {
   })
 }
 
-/** Pips in a table: a fixed label column, the pips, the count at a fixed column, a note. */
-function pipTable(el: Base, surface: string, rows: Pips[], labelProps: TextProps): RenderNode[] {
+/** Pips in a table: a fixed label column, the pips, the count at a fixed column (inverse while flashing), a note. */
+function pipTable(el: Base, surface: string, rows: Pips[], labelProps: TextProps, flashing: Set<number>): RenderNode[] {
   const labelW = Math.min(20, Math.max(1, ...rows.map((r) => r.label.length)))
   const pipW = Math.min(17, Math.max(1, ...rows.map((r) => r.max * 2 - 1)))
-  return rows.map((r) =>
+  return rows.map((r, i) =>
     row(el, [
       el.Box({ width: labelW, flexShrink: 0, children: [text(el, r.label, { ...labelProps, wrap: 'wrap' })] }),
       el.Box({ width: pipW, flexShrink: 0, children: [pipsNode(el, surface, r.left, r.max, pipW, 'ink', of(r.left, r.max))] }),
-      value(el, `${r.left}/${r.max}`, r.pending),
+      value(el, `${r.left}/${r.max}`, r.pending, flashing.has(i)),
       ...(r.note ? [dim(el, r.note)] : []),
     ]),
   )
 }
 
-/**
- * A weapon line as a player reads it: "+2 · 1d8 bludgeoning". The transcription
- * writes "attack written +2, 1d8 bludgeoning; …"; only that prefix is taken off,
- * the rest follows after a ·. Anything else is shown as written. No bonus is computed.
- */
-export function weaponLine(note: string): string {
-  const m = /^attack written ([+-]\d+), (.+)$/.exec(note.trim())
-  return m ? [m[1], ...(m[2] ?? '').split('; ')].join(' · ') : note
-}
-
-/** Actions: what can I roll? Spells by level (slot pips beside each heading, a line per class), then weapons. */
+/** Actions: the turn menu. Weapons, cantrips, each slot level (its pips beside the heading), other magic; a row per action. */
 function actionsTab(el: Base, e: Entry, surface: string): RenderNode[] {
-  const out: RenderNode[] = []
   const slots = new Map(slotRows(e).map((s) => [s.level, s]))
-  const byLevel = new Map<number, Map<string, string[]>>()
-  const add = (lvl: number, cls: string, name: string) => {
-    const level = byLevel.get(lvl) ?? new Map<string, string[]>()
-    level.set(cls, [...(level.get(cls) ?? []), name])
-    byLevel.set(lvl, level)
-  }
-  for (const sc of e.sheet.spellcasting?.by_class ?? []) {
-    for (const c of sc.cantrips ?? []) add(0, sc.class, c.name + dmMark(e, c.name))
-    for (const sp of sc.spells ?? []) add(sp.level ?? 0, sc.class, sp.name + (sp.always ? ' (always)' : '') + dmMark(e, sp.name))
-  }
-  const classW = Math.max(0, ...[...byLevel.values()].flatMap((m) => [...m.keys()].map((c) => c.length))) + 1
-  const classLine = (cls: string, names: string[]) =>
-    el.Box({ flexDirection: 'row', children: [el.Box({ width: classW, flexShrink: 0, children: [dim(el, cls)] }), text(el, names.join(', '), { wrap: 'wrap' })] })
-  for (const [lvl, classes] of [...byLevel].sort(([a], [b]) => a - b)) {
-    const s = slots.get(lvl)
-    const label = lvl === 0 ? 'Cantrips' : `${ORDINAL(String(lvl))} level`
+  const groups = actionGroups(e, slots, (name) => rulesNaming(e, name) > 0)
+  // The class leads a row only when more than one class casts, so a reader knows whose DC it is.
+  const showCls = new Set(groups.flatMap((g) => g.rows.map((r) => r.cls)).filter(Boolean)).size > 1
+  const actionRow = (r: ActionRow) =>
+    col(el, [
+      el.Box({
+        flexDirection: 'row',
+        justifyContent: 'space-between',
+        columnGap: 1,
+        children: [
+          wrapRow(
+            el,
+            [
+              text(el, r.name + (r.dm ? ' ★' : ''), { bold: true, wrap: 'wrap' }),
+              ...(r.always ? [dim(el, 'always')] : []),
+              ...r.badges.map((b) => dim(el, b.toUpperCase())),
+            ],
+            1,
+          ),
+          ...(r.effect ? [el.Box({ flexShrink: 0, children: [text(el, r.effect, { bold: true })] })] : []),
+        ],
+      }),
+      el.Box({
+        paddingLeft: 2,
+        children: [
+          wrapRow(
+            el,
+            [
+              ...(showCls && r.cls ? [dim(el, r.cls + ' ·')] : []),
+              // The lead carries the server's number; while that number may change, amber as `value` draws it.
+              ...(r.lead ? [text(el, r.lead, e.derivedPending && r.lead.endsWith('?') ? { color: TOKENS.amber } : {})] : []),
+              ...(r.facts.length ? [dim(el, r.facts.join(' · '))] : []),
+            ],
+          ),
+        ],
+      }),
+      ...(r.written ? [el.Box({ paddingLeft: 2, children: [dim(el, 'Sheet: ' + r.written)] })] : []),
+    ])
+  const out = groups.map((g) => {
+    const s = g.slots
     const pipW = s ? Math.min(17, Math.max(1, s.max * 2 - 1)) : 0
     const pips = s ? [pipsNode(el, surface, s.left, s.max, pipW, 'ink', of(s.left, s.max)), value(el, `${s.left}/${s.max}`, s.pending)] : []
-    out.push(section(el, heading(el, label, pips), [...classes].map(([cls, names]) => classLine(cls, names))))
-  }
-  const other = (e.sheet.spellcasting?.other ?? []).map((x: any) => x.name + dmMark(e, x.name))
-  if (other.length) out.push(section(el, heading(el, 'Other magic'), [text(el, other.join(', '), { wrap: 'wrap' })]))
-  // Weapons: the items whose transcription note carries the written attack.
-  const weapons = (e.sheet.inventory ?? []).filter((i: any) => /\battack\b/i.test(String(i.note ?? '')))
-  if (weapons.length) {
-    out.push(
-      section(
-        el,
-        heading(el, 'Weapons (as written)'),
-        weapons.map((i: any) => row(el, [text(el, i.name, { bold: true }), text(el, weaponLine(String(i.note)), { wrap: 'wrap' })])),
-      ),
-    )
-  }
+    return section(el, heading(el, g.label, pips), g.rows.map(actionRow))
+  })
   if (!out.length) out.push(dim(el, 'No spells or written attacks on this sheet.'))
   return out
 }
@@ -428,6 +456,20 @@ function tabBody(el: Base, e: Entry, tab: TabId, surface: string): RenderNode[] 
   }
 }
 
+/** Does the flash touch a path this pattern names? */
+const flashes = (v: PaneView, re: RegExp) => !!v.flash?.some((p) => re.test(p))
+/** The indexes of the rows whose pattern the flash touches. */
+const flashing = (v: PaneView, patterns: RegExp[]) => new Set(patterns.flatMap((re, i) => (flashes(v, re) ? [i] : [])))
+const slotPath = (s: { label: string; level: number }) =>
+  s.label === 'Pact' ? /^\/spellcasting\/pact_slots_used(\/|$)/ : new RegExp(`^/spellcasting/slots_used/${s.level}(/|$)`)
+
+/** `CHECK 13:19 · 3 WARNINGS · 5 NOTES`, `· NOT RE-CHECKED` once the sheet moved on. */
+function checkText(c: NonNullable<Entry['check']>, version: number): string {
+  const n = (k: number, word: string) => `${k} ${word}${k === 1 ? '' : 'S'}`
+  const counts = c.warnings + c.infos ? `${n(c.warnings, 'WARNING')} · ${n(c.infos, 'NOTE')}` : 'CLEAN'
+  return `CHECK ${clock(c.at)} · ${counts}` + (c.version === version ? '' : ' · NOT RE-CHECKED')
+}
+
 const hpOf = (e: Entry) => {
   const hp = e.sheet.hp ?? {}
   return { current: Number(hp.current ?? 0), max: Number(hp.max ?? 0), temp: Number(hp.temp ?? 0) }
@@ -437,6 +479,7 @@ const hpOf = (e: Entry) => {
 
 /** The pane: identity, vitals, slots, resources, the tab row, the open tab, the freshness readout. */
 export function paneTree(el: Els, v: PaneView): RenderElement {
+  if (v.view === 'party') return partyTree(el, v)
   const e = v.entry
   if (!e) {
     return col(el, [
@@ -449,28 +492,36 @@ export function paneTree(el: Els, v: PaneView): RenderElement {
 
   // The DM-rules badge, a press away from the Notes tab.
   const rules = (e.sheet.house_rules ?? []).length
-  if (rules) kids.push(make({ key: RULES_KEY, label: `★ ${rules} dm rule${rules === 1 ? '' : 's'}`, hotkey: 'm', plain: true }))
+  // Beside it, the way to the party view, once there is more than this sheet to show.
+  const showParty = v.rows.length > 1 || v.log !== null
+  const badges = [
+    ...(rules ? [make({ key: RULES_KEY, label: `★ ${rules} dm rule${rules === 1 ? '' : 's'}`, hotkey: 'm', plain: true })] : []),
+    ...(showParty ? [make({ key: 'view-party', label: 'party', hotkey: '0', plain: true })] : []),
+  ]
+  if (badges.length) kids.push(wrapRow(el, badges))
   // The alert field: inverse, the MU-TH-UR highlight. The words are the signal, the colour the second one.
   const alert = alertText(e.sheet.conditions ?? [], Number(e.sheet.exhaustion ?? 0))
-  if (alert) kids.push(text(el, alert, { color: TOKENS.amber, inverse: true, bold: true, wrap: 'wrap' }))
+  const alertFlash = flashes(v, /^\/(conditions(\/|$)|exhaustion$)/)
+  if (alert) kids.push(text(el, alert, { color: TOKENS.amber, inverse: true, bold: true, ...(alertFlash ? { underline: true } : {}), wrap: 'wrap' }))
 
   // Vitals. On the terminal HP digits are always ink, inverse once HP is in
   // alert; the state colour is on the gauge. Elsewhere the numbers are the
   // pixel instrument, knocked out on an alert plate, and its alt carries them.
   const { current, max, temp } = hpOf(e)
   const state = hpState(current, max)
+  const hpFlash = flashes(v, /^\/hp(\/|$)/)
   const digits = `${current}/${max}`
   const tempText = temp > 0 ? `+${temp} TEMP` : ''
   const room = Math.max(10, v.columns - 2 - 2 - digits.length - 2 - (tempText ? tempText.length + 2 : 0))
   kids.push(
     ruleLine(el, 'Vitals', v.columns),
     pixel(v.surface)
-      ? el.Box({ flexDirection: 'row', columnGap: 2, alignItems: 'center', children: [dim(el, 'HP'), svg(el, hpSvg(current, max, temp, state))] })
+      ? el.Box({ flexDirection: 'row', columnGap: 2, alignItems: 'center', children: [dim(el, 'HP'), svg(el, hpSvg(current, max, temp, state, { flash: hpFlash }))] })
       : row(
           el,
           [
             dim(el, 'HP'),
-            text(el, digits, { bold: true, ...(state === 'alert' ? { inverse: true } : {}) }),
+            text(el, digits, { bold: true, ...(state === 'alert' || hpFlash ? { inverse: true } : {}) }),
             gauge(el, gaugeRuns(hpSegments(current, max, temp, room), state)),
             ...(tempText ? [text(el, tempText, { color: TOKENS.cyan, bold: true })] : []),
           ],
@@ -489,19 +540,204 @@ export function paneTree(el: Els, v: PaneView): RenderElement {
   const cs = casters(e)
   if (cs.length) kids.push(wrapRow(el, cs.map((c) => row(el, [dim(el, c.cls), stat(el, 'DC', c.dc, e.derivedPending), stat(el, 'ATK', c.attack, e.derivedPending)]))))
   const slots = slotRows(e)
-  if (slots.length) kids.push(ruleLine(el, 'Slots', v.columns), ...pipTable(el, v.surface, slots, { dimColor: true }))
+  if (slots.length) kids.push(ruleLine(el, 'Slots', v.columns), ...pipTable(el, v.surface, slots, { dimColor: true }, flashing(v, slots.map(slotPath))))
   const res = resources(e)
-  if (res.length) kids.push(ruleLine(el, 'Resources', v.columns), ...pipTable(el, v.surface, res, {}))
+  const resPaths = res.map((_, i) => new RegExp(`^/resources/${i}(/|$)`))
+  if (res.length) kids.push(ruleLine(el, 'Resources', v.columns), ...pipTable(el, v.surface, res, {}, flashing(v, resPaths)))
 
-  // The tab row and the open tab; a blank row above the tab row and the readout.
+  // The tab row and the open tab; a blank row above the tab row and the readouts
+  // (freshness, then the last check's count: bookkeeping, faint unless it warns).
+  const c = e.check
   kids.push(
     el.Box({ flexDirection: 'row', flexWrap: 'wrap', columnGap: 1, marginTop: 1, children: tabProps(v.surface, v.tab).map(make) }),
     ruleLine(el, v.tab, v.columns),
     ...tabBody(el, e, v.tab, v.surface),
-    el.Box({ marginTop: 1, children: [text(el, freshness(e, v.now), { color: TOKENS.faint, wrap: 'wrap' })] }),
+    el.Box({
+      flexDirection: 'column',
+      marginTop: 1,
+      children: [
+        text(el, freshness(e, v.now), { color: TOKENS.faint, wrap: 'wrap' }),
+        ...(c ? [text(el, checkText(c, e.version), { color: c.warnings && c.version === e.version ? TOKENS.amber : TOKENS.faint, wrap: 'wrap' })] : []),
+      ],
+    }),
   )
   done()
   return col(el, kids)
+}
+
+/** `TABLE LOG · OPEN · 3 ENTRIES SEEN`, `· CLOSED 13:52`; `· NONE YET` with a session and nothing seen. */
+function logState(session: string | null, log: TableLog | null): string | null {
+  if (!session) return null
+  const n = log?.entries.length ?? 0
+  const closed = log?.closedAt ? ` · CLOSED ${clock(log.closedAt)}` : log?.manifest?.tableExists ? ' · CLOSED' : ''
+  if (!n && !closed) return 'TABLE LOG · NONE YET'
+  return `TABLE LOG · ${closed ? '' : 'OPEN · '}${n} ENTR${n === 1 ? 'Y' : 'IES'} SEEN` + closed
+}
+
+/** The faint readout under the party: the last re-read, else the oldest read. */
+function rereadText(v: PaneView): string | null {
+  const r = v.reread
+  if (r && 'refused' in r) return `RE-READ REFUSED · ALLOW ${r.refused}`
+  if (r && 'failed' in r) return `RE-READ FAILED · ${r.failed}`
+  if (r) return `RE-READ ${clock(r.at)} · SHEETS ${r.sheets} OF ${r.listed}`
+  if (!v.rows.length) return null
+  const oldest = Math.min(...v.rows.map((e) => e.readAt))
+  return sameDay(oldest, v.now) ? `OLDEST READ ${clock(oldest)}` : `OLDEST READ · ${day(oldest)}`
+}
+
+/**
+ * The party view: the session, the log's state, a row per sheet (AC, HP, the
+ * gauge, PP), the Table log's last entries, the re-read and its readout. A
+ * sheet not confirmed in the last 15 minutes is drawn hollow: its current HP
+ * unknown, the gauge empty, its freshness under the name.
+ *
+ * While a fight is on, the status line, the last typed line and `next`/`undo`
+ * take the log state's place, and `── ORDER` comes above `── PARTY`: the PCs in
+ * the fight move into it, so none is drawn twice. The entry line is last, where
+ * the surface has `Input`; the grammar beneath it after a refusal or with no fight.
+ */
+function partyTree(el: Els, v: PaneView): RenderElement {
+  const { make, done } = buttons(el, v.memo)
+  const kids: RenderNode[] = []
+  const m = v.log?.manifest
+  const f = live(v.fight)
+  kids.push(
+    v.session
+      ? row(el, [dim(el, 'SESSION'), text(el, v.session + (m?.title ? ` · ${m.title}` : ''), { wrap: 'wrap' })], 2)
+      : text(el, 'NO SESSION · /party S04, or start the Table operation', { dimColor: true, wrap: 'wrap' }),
+  )
+  const state = logState(v.session, v.log)
+  if (f) {
+    kids.push(text(el, statusText(f), { wrap: 'wrap' }))
+    const last = f.log[f.log.length - 1]
+    if (last) kids.push(dim(el, `${clock(last.at)}  ${last.text}` + (last.working ? `  ${last.working}` : '') + (last.reverted ? '  undone' : '')))
+    kids.push(row(el, [make({ key: 'next', label: 'next', hotkey: 'n', plain: true }), make({ key: 'undo', label: 'undo', hotkey: 'u', plain: true })], 2))
+  } else if (state) kids.push(text(el, state, { dimColor: true, wrap: 'wrap' }))
+
+  /** A PC's name as the party view's button, hotkey 1–9 by roster position, padded to `w`. */
+  const pcButton = (e: Entry, w: number) => {
+    const i = v.rows.indexOf(e)
+    const name = e.name.slice(0, w)
+    const pad = w - name.length
+    return row(el, [make({ key: 'pc-' + e.id, label: name, ...(i < 9 ? { hotkey: String(i + 1) } : {}), plain: true }), ...(pad ? [text(el, ' '.repeat(pad))] : [])], 0)
+  }
+  /** A PC's HP and gauge, from the sheet; hollow when stale. */
+  const pcHp = (e: Entry): RenderNode[] => {
+    const { current, max } = hpOf(e)
+    const hollow = stale(e.readAt, v.now)
+    const hp = hpState(current, max)
+    return [
+      text(el, hollow ? `—/${max}` : `${current}/${max}`, { bold: true, ...(!hollow && hp === 'alert' ? { inverse: true } : {}) }),
+      hollow
+        ? gaugeNode(el, v.surface, bandSegments(0, max), 'ink', `HP unknown, max ${max}`)
+        : gaugeNode(el, v.surface, bandSegments(current, max), hp, `HP ${current} of ${max}`),
+    ]
+  }
+  /** Under a PC's row, indented: its freshness when hollow, its alert field. */
+  const pcNotes = (e: Entry, left: number): RenderNode[] => {
+    const indent = (node: RenderNode) => el.Box({ paddingLeft: left, children: [node] })
+    const notes: RenderNode[] = []
+    if (stale(e.readAt, v.now)) notes.push(indent(text(el, freshness(e, v.now), { color: TOKENS.faint, wrap: 'wrap' })))
+    const alert = alertText(e.sheet.conditions ?? [], Number(e.sheet.exhaustion ?? 0))
+    if (alert) notes.push(indent(text(el, alert, { color: TOKENS.amber, inverse: true, bold: true, wrap: 'wrap' })))
+    return notes
+  }
+
+  const fought = new Set(f?.rows.map((r) => r.id) ?? [])
+  if (f) {
+    kids.push(ruleLine(el, 'Order', v.columns))
+    const order = orderRows(f)
+    const sheetOf = (r: Row) => (r.side === 'pc' ? v.rows.find((e) => e.id === r.id) : undefined)
+    const drawn = (r: Row) => sheetOf(r)?.name ?? (r.members.length > 1 ? `${r.name} ×${r.members.length}` : r.name)
+    const w = Math.min(14, Math.max(1, ...order.map((r) => drawn(r).length)))
+    for (const r of order) {
+      const e = sheetOf(r)
+      const acting = f.pointer === r.id
+      const name = drawn(r).slice(0, w)
+      const sheetAc = e ? String(e.sheet.ac?.value ?? '?') : '?'
+      const ac =
+        r.side === 'pc' && r.ac !== null
+          ? row(el, [dim(el, 'AC'), row(el, [text(el, sheetAc + '→'), value(el, String(r.ac))], 0)])
+          : stat(el, 'AC', r.side === 'pc' ? sheetAc : r.ac === null ? '?' : String(r.ac))
+      kids.push(
+        el.Box({
+          flexDirection: 'row',
+          flexWrap: 'wrap',
+          columnGap: 2,
+          children: [
+            row(el, [
+              text(el, (acting ? '▶ ' : '  ') + (r.init === null ? '?' : String(r.init)).padStart(2)),
+              r.side === 'pc' ? text(el, '◆', { color: TOKENS.phosphor }) : text(el, '▲', { dimColor: true }),
+              e ? pcButton(e, w) : text(el, name.padEnd(w), { wrap: 'truncate', ...(acting ? { bold: true } : {}) }),
+            ]),
+            ac,
+            ...(e ? pcHp(e) : r.side === 'monster' ? monsterHp(el, v.surface, r) : []),
+            ...(r.down ? [text(el, '▒DOWN▒', { color: TOKENS.amber, inverse: true, bold: true })] : []),
+            ...(r.out ? [dim(el, 'OUT')] : []),
+          ],
+        }),
+      )
+      if (e) kids.push(...pcNotes(e, w + 12))
+    }
+  }
+
+  const party = v.rows.filter((e) => !fought.has(e.id))
+  if (party.length || !f) kids.push(ruleLine(el, 'Party', v.columns))
+  const nameW = Math.min(12, Math.max(1, ...v.rows.map((e) => e.name.length)))
+  for (const e of party) {
+    kids.push(
+      el.Box({
+        flexDirection: 'row',
+        flexWrap: 'wrap',
+        columnGap: 2,
+        children: [
+          pcButton(e, nameW),
+          stat(el, 'AC', String(e.sheet.ac?.value ?? '?')),
+          ...pcHp(e),
+          stat(el, 'PP', String(e.derived?.passive_perception ?? '?'), e.derivedPending || !e.derived),
+        ],
+      }),
+      ...pcNotes(e, nameW + 5),
+    )
+  }
+  if (!v.rows.length) {
+    kids.push(
+      row(el, [text(el, 'AWAITING SHEETS'), text(el, '█', { color: TOKENS.phosphor })]),
+      text(el, 'Press e to read every sheet this connector serves, or ask Claude to.', { dimColor: true, wrap: 'wrap' }),
+    )
+  }
+
+  const entries = v.log?.entries ?? []
+  if (entries.length) {
+    kids.push(ruleLine(el, 'Table log', v.columns))
+    if (entries.length > 8) kids.push(dim(el, `${entries.length - 8} earlier`))
+    for (const t of entries.slice(-8)) kids.push(row(el, [dim(el, clock(t.at)), text(el, t.text, { wrap: 'wrap' })], 2))
+  }
+
+  kids.push(el.Box({ flexDirection: 'row', marginTop: 1, children: [make({ key: 'reread', label: 're-read', hotkey: 'e', plain: true })] }))
+  const readout = rereadText(v)
+  if (readout) kids.push(text(el, readout, { color: TOKENS.faint, wrap: 'wrap' }))
+
+  // The entry line: the ui.input hook in register.ts applies what is typed. The
+  // phone's table has no Input (Elements['mobile']), but resolve hands it one
+  // that draws an empty Box, so the surface is asked too.
+  if ('Input' in el && v.surface !== 'mobile') {
+    const placeholder = 'm3 -9 · nux 16 · smoke mephit x6 hp 22 ac 12'
+    kids.push(el.Box({ marginTop: 1, children: [el.Input({ key: 'entry', label: 'entry', placeholder, value: v.typed, autoFocus: true, submitLabel: 'apply', onSubmit: NOOP })] }))
+    if (v.refused) kids.push(text(el, v.refused, { color: TOKENS.amber, wrap: 'wrap' }))
+    if (v.refused || !f) kids.push(...GRAMMAR.map((g) => text(el, g, { dimColor: true, wrap: 'wrap' })))
+  }
+  done()
+  return col(el, kids)
+}
+
+/** A monster's HP: a single one's `hp/max` and gauge, `0?` or `✕`; a group's members as a run, `22 13 0? ✕`. */
+function monsterHp(el: Base, surface: string, r: Row): RenderNode[] {
+  const one = (m: Member) => (m.dead ? '✕' : m.zero ? '0?' : String(m.hp))
+  if (r.members.length > 1) return [text(el, r.members.map(one).join(' '))]
+  const m = r.members[0]!
+  if (m.dead || m.zero) return [text(el, one(m), { bold: true })]
+  return [text(el, `${m.hp}/${m.max}`, { bold: true }), gaugeNode(el, surface, bandSegments(m.hp, m.max), hpState(m.hp, m.max), `HP ${m.hp} of ${m.max}`)]
 }
 
 /** The band strip, while the pane is closed: name, a 10-cell HP gauge, HP, slots, the key hint. */
@@ -521,4 +757,24 @@ export function bandTree(el: Els, e: Entry, surface: string): RenderElement {
   }
   kids.push(text(el, '/sheet', { dimColor: true }))
   return row(el, kids)
+}
+
+/**
+ * A connector call's row in the transcript: the verb readout in a ten-column
+ * box, then the words. One line, the same on every surface; an error's verb is
+ * the alert field's amber inverse, a running call's words are dim.
+ */
+export function receiptTree(el: Els, r: Receipt): RenderElement {
+  const verbProps: TextProps = r.state === 'error' ? { color: TOKENS.amber, inverse: true, bold: true, wrap: 'truncate' } : { dimColor: true, wrap: 'truncate' }
+  return el.Box({
+    flexDirection: 'row',
+    columnGap: 1,
+    paddingLeft: RECEIPT_INDENT,
+    children: [el.Box({ width: 10, flexShrink: 0, children: [text(el, r.verb, verbProps)] }), text(el, r.body, { wrap: 'wrap', ...(r.state === 'running' ? { dimColor: true } : {}) })],
+  })
+}
+
+/** A receipt's result block (ctrl+o): the detail lines dim, then Claude Code's own block, last and once. */
+export function detailTree(el: Els, r: Receipt, engine: RenderNode): RenderElement {
+  return el.Box({ flexDirection: 'column', paddingLeft: RECEIPT_INDENT, children: [...r.detail.map((l) => text(el, l, { dimColor: true, wrap: 'wrap' })), engine] })
 }
