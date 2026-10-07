@@ -16,10 +16,10 @@
 // Mods API calls: $.ui, $.store, $.command, $.clock, $.tool only. Every call
 // lives in this file; sheet.ts, table.ts, look.ts, receipt.ts and view.ts are pure.
 
-import type { EngineInterface, On, RenderElement, ToolCallArgs } from 'claude-code'
+import type { EngineInterface, MatchedHook, On, RenderElement, ToolCallArgs } from 'claude-code'
 import { fold, parseLine, undoTarget, type Event, type Fight } from './fight.ts'
 import { FLASH_MS } from './look.ts'
-import { CONNECTOR, receipt } from './receipt.ts'
+import { CONNECTOR, VAULT, receipt } from './receipt.ts'
 import { asApplied, asCheck, asGet, entryAfterWrite, entryFromGet, matchEntry, payloadOf, type Entry } from './sheet.ts'
 import { applyWrite, asManifest, asTableWrite, isSessionId, rosterRows, type TableLog } from './table.ts'
 import { bandTree, detailTree, paneTree, receiptTree, RULES_KEY, TABS, tabKey, tabOf, type Reread, type TabId } from './view.ts'
@@ -58,6 +58,12 @@ let fightEvents: Event[] = [] // the current fight's typed lines and undos, as s
 let fightId: string | null = null
 let typed = '' // the entry line's text, kept across redraws
 let refused: string | null = null // why the last line was refused, until one applies
+
+// The receipt hook for both tool families; the mods loader takes hooks only from the top level.
+const rowHook: MatchedHook<'ui.render', { component: 'ToolUse' }> = ($, e, next) => {
+  const r = receipt(e.props, (id) => sheets.get(id)?.sheet)
+  return r ? receiptTree($.ui.resolve(e), r) : next(e)
+}
 
 const message = (err: unknown) => (err instanceof Error ? err.message : String(err))
 const focused = () => (focus ? sheets.get(focus) ?? null : null)
@@ -412,15 +418,15 @@ export function register(on: On) {
     return next({ ...e, value: typed })
   })
 
-  // Connector calls fold into one "Called CCC MCP n times" line. The matcher selects only
-  // the groups holding a connector call (a pattern against an array holds when some element
+  // Connector and vault calls fold into one "Called … n times" line. The matcher selects only
+  // the groups holding either call (a pattern against an array holds when some element
   // matches); the rewrite unfolds them, and each call is then a ToolUse row the receipt hook draws.
   on('ui.render', { component: 'ToolGroup', props: { calls: { tool: CONNECTOR } } }, ($, e, next) =>
     next({ ...e, props: { ...e.props, isExpanded: true } }))
-  on('ui.render', { component: 'ToolUse', props: { tool: CONNECTOR } }, ($, e, next) => {
-    const r = receipt(e.props, (id) => sheets.get(id)?.sheet)
-    return r ? receiptTree($.ui.resolve(e), r) : next(e)
-  })
+  on('ui.render', { component: 'ToolGroup', props: { calls: { tool: VAULT } } }, ($, e, next) =>
+    next({ ...e, props: { ...e.props, isExpanded: true } }))
+  on('ui.render', { component: 'ToolUse', props: { tool: CONNECTOR } }, rowHook)
+  on('ui.render', { component: 'ToolUse', props: { tool: VAULT } }, rowHook)
   // The result block is drawn in the ctrl+o transcript only (probe finding 8): the findings
   // in words, then Claude Code's own block, never hidden.
   on('ui.render', { component: 'ToolResult', props: { tool: CONNECTOR } }, async ($, e, next) => {

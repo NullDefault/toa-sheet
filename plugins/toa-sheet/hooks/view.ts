@@ -463,11 +463,10 @@ const flashing = (v: PaneView, patterns: RegExp[]) => new Set(patterns.flatMap((
 const slotPath = (s: { label: string; level: number }) =>
   s.label === 'Pact' ? /^\/spellcasting\/pact_slots_used(\/|$)/ : new RegExp(`^/spellcasting/slots_used/${s.level}(/|$)`)
 
-/** `CHECK 13:19 · 3 WARNINGS · 5 NOTES`, `· NOT RE-CHECKED` once the sheet moved on. */
-function checkText(c: NonNullable<Entry['check']>, version: number): string {
+/** `CHECK 13:19 · 3 WARNINGS · 5 NOTES`. */
+function checkText(c: NonNullable<Entry['check']>): string {
   const n = (k: number, word: string) => `${k} ${word}${k === 1 ? '' : 'S'}`
-  const counts = c.warnings + c.infos ? `${n(c.warnings, 'WARNING')} · ${n(c.infos, 'NOTE')}` : 'CLEAN'
-  return `CHECK ${clock(c.at)} · ${counts}` + (c.version === version ? '' : ' · NOT RE-CHECKED')
+  return `CHECK ${clock(c.at)} · ${n(c.warnings, 'WARNING')} · ${n(c.infos, 'NOTE')}`
 }
 
 const hpOf = (e: Entry) => {
@@ -557,7 +556,7 @@ export function paneTree(el: Els, v: PaneView): RenderElement {
       marginTop: 1,
       children: [
         text(el, freshness(e, v.now), { color: TOKENS.faint, wrap: 'wrap' }),
-        ...(c ? [text(el, checkText(c, e.version), { color: c.warnings && c.version === e.version ? TOKENS.amber : TOKENS.faint, wrap: 'wrap' })] : []),
+        ...(c && c.warnings > 0 && c.version === e.version ? [text(el, checkText(c), { color: TOKENS.faint, wrap: 'wrap' })] : []),
       ],
     }),
   )

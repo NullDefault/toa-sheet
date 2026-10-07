@@ -4,6 +4,8 @@
 // input, so a mismatched answer passes; words may come from the input (a
 // preview's reason, a create's action). Anything the shapes below do not
 // match is `null`: the row stays Claude Code's own.
+// Vault receipts describe the request; LOGGED/CLOSED alone are confirmed by
+// the answer. The engine's result block is their detail. Interrupted rows pass.
 //
 // Pure and synchronous: every pane invalidate redraws every connector row
 // (`$.ui.invalidate('ui.render')` is plugin-wide). No mods API here.
@@ -13,6 +15,9 @@ import { asApplied, asCheck, asGet, describeChange, payloadOf, textOf, type Diff
 /** The rules connector's tools that draw a receipt; each has a fixture in tests/fixtures/bati. */
 export const CONNECTOR =
   /^mcp__.+__(sheet_read|sheet_write|level_up|spell_get|monster_get|character_option_get|condition_search|variantrule_search|book_content_get)$/
+
+/** The vault's tools whose rows draw a receipt during play; `receipt()` draws the Table kinds and the reads. */
+export const VAULT = /^mcp__vault__(vault_query|canon_query|draft_write)$/
 
 export interface Receipt {
   verb: string
@@ -179,8 +184,49 @@ function lookup(t: string, d: unknown, input: unknown): Receipt | null {
   return null
 }
 
+/** Vault reads say what was asked; only a confirmed Table write says LOGGED/CLOSED. */
+function vaultReceipt(t: string, row: Row): Receipt | null {
+  const input = isObj(row.input) ? row.input : {}
+  const req = request(row.input)
+  const write = t === 'draft_write'
+  const note = input.kind === 'table-note'
+  let verb: string
+  let body: string
+  if (write) {
+    if (!note && input.kind !== 'table-close') return null
+    if (typeof input.text !== 'string' || typeof input.session !== 'string') return null
+    verb = note ? 'LOGGED' : 'CLOSED'
+    body = note ? input.text : `${input.session} · ${input.text}`
+  } else if (t === 'vault_query') {
+    if (typeof req.action !== 'string') return null
+    verb = 'VAULT'
+    const arg = [req.id, req.name, req.npc, req.query, req.text, req.since, req.session].find((v) => typeof v === 'string')
+    body = req.action + (arg === undefined ? '' : ` ${arg}`)
+  } else {
+    verb = 'CANON'
+    if (req.action === 'search' && typeof req.query === 'string')
+      body = `search "${req.query}"` + (typeof req.book === 'string' ? ` · ${req.book}` : '')
+    else if (req.action === 'page' && typeof req.book === 'string' && typeof req.printed_page === 'number')
+      body = `${req.book} p.${req.printed_page}`
+    else return null
+  }
+  if (row.isRunning && row.output === undefined)
+    return { verb: write ? (note ? 'LOG' : 'CLOSE') : verb, body: (write ? input.text : body) + ' …', state: 'running', detail: [] }
+  if (row.isErrored) {
+    const text = textOf(row.output)
+    return text ? { verb: write ? 'REFUSED' : 'ERROR', body: firstSentence(text), state: 'error', detail: [] } : null
+  }
+  const p = payloadOf(row.output)
+  if (!p || !('data' in p)) return null
+  if (write && (!isObj(p.data) || p.data.wrote !== true)) return null
+  if (t === 'canon_query' && req.action === 'search' && isObj(p.data) && p.data.total === 0) body += ' · NO HIT'
+  return done(verb, body)
+}
+
 /** The receipt for a connector row, or null when the row should stay Claude Code's. */
 export function receipt(row: Row, sheetOf: Sheets): Receipt | null {
+  const v = row.tool.match(VAULT)
+  if (v && !row.isInterrupted) return vaultReceipt(v[1]!, row)
   const m = row.tool.match(CONNECTOR)
   if (!m || row.isInterrupted) return null
   const t = m[1]!
