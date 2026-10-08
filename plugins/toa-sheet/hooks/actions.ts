@@ -31,7 +31,7 @@ export interface ActionRow {
    * to roll with the sheet's number: `ATK +5`, `CON save DC 11`, `ATK +2 (as written)`.
    */
   lead: string
-  /** The rest, dim: casting time, range, duration, components; or a weapon's properties. */
+  /** The rest, dim: the level when no heading says it, range, a duration that is not instant; or a weapon's properties. */
   facts: string[]
   badges: ('conc' | 'ritual')[]
   /** The rest of the sheet's own line for a weapon, after its bonus ("1d8 bludgeoning"), shown as written. */
@@ -122,7 +122,6 @@ export function cantripDice(table: string, level: number | null): string {
 // ------------------------------------------------------------------ wording
 
 const ORDINAL = (l: number) => ({ 1: '1st', 2: '2nd', 3: '3rd' })[l] ?? l + 'th'
-const COMPONENTS = (c: string) => [...c].join(', ')
 const signed = (n: unknown) => (typeof n === 'number' ? (n >= 0 ? '+' + n : String(n)) : typeof n === 'string' ? n : '?')
 
 /** `1d10 fire`, `5d6 fire/radiant`, `3d8 · 6 types`, `force`. */
@@ -141,7 +140,7 @@ export function spellRow(key: string, name: string, source: string | undefined, 
   const hit = spellFact(name, source, e.sheet.ruleset)
   const base = { key, name, cls: opts.cls, dm: opts.dm, always: opts.always, written: '', badges: [] as ActionRow['badges'] }
   if (!hit) return { ...base, effect: '', lead: '', facts: ['Not in the rules snapshot'], missing: true, source: source ?? '' }
-  const [level, , time, range, comps, duration, flagText, damage, save, diceText] = hit.row
+  const [level, , time, range, , duration, flagText, damage, save, diceText] = hit.row
   const flags = flagText ? flagText.split(' ') : []
   const types = damage ? damage.split(',') : []
   const total = typeof e.derived?.total_level === 'number' ? e.derived.total_level : null
@@ -158,10 +157,8 @@ export function spellRow(key: string, name: string, source: string | undefined, 
   const lead = [...(time !== 'Action' && effect !== time ? [time] : []), ...(roll ? [roll] : [])].join(' · ')
   const facts = [
     ...(opts.otherLevel ? [level === 0 ? 'Cantrip' : ORDINAL(level)] : []),
-    ...(time === 'Action' ? [time] : []),
     range,
     ...(duration && duration !== 'Instant' ? [duration] : []),
-    COMPONENTS(comps),
   ].filter(Boolean)
   const badges: ActionRow['badges'] = [...(flags.includes('conc') ? ['conc' as const] : []), ...(flags.includes('ritual') ? ['ritual' as const] : [])]
   return { ...base, effect, lead, facts, badges, missing: false, source: hit.source }

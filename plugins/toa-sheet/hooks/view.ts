@@ -35,7 +35,7 @@ export type Els = Elements[keyof Elements]
 /** The elements every surface has, which the pane draws with. */
 type Base = Pick<Elements['mobile'], 'Box' | 'Text' | 'Button' | 'Markdown'>
 
-/** The tabs, by the player's question. Hotkeys leave `d h r u t` free for later taps. */
+/** The tabs, by the player's question. Hotkeys keep clear of the taps (`d h u`, a slot's digit, `p`); `r` and `t` stay free. */
 export const TABS = [
   { id: 'actions', label: 'actions', hotkey: 'a', words: ['actions', 'action', 'spells', 'attacks'] },
   { id: 'saves', label: 'saves', hotkey: 's', words: ['saves', 'save', 'skills', 'checks'] },
@@ -59,6 +59,8 @@ export const tabKey = (id: TabId) => 'tab-' + id
 export type Reread = { at: number; sheets: number; listed: number } | { refused: string } | { failed: string }
 /** The number field's question: which number, for which row and member, and its text so far. */
 export type Ask = { kind: 'damage' | 'heal' | 'init'; row: string; member: number; text: string }
+/** The sheet view's number field: damage or healing for the focused sheet, and its text so far. */
+export type Tap = { kind: 'damage' | 'heal'; text: string }
 /** The add form's five fields, as the DM has filled them so far. */
 export type Adding = { name: string; count: string; hp: string; ac: string; init: string }
 
@@ -94,6 +96,8 @@ export interface PaneView {
   adding: Adding | null
   /** Why the last key did nothing, until an op applies. */
   note: string | null
+  /** The sheet view's open number field, for a tap. */
+  tap: Tap | null
 }
 
 /** The fight's keys, in the key row's order: [element key, hotkey, label]. */
@@ -156,19 +160,22 @@ interface Pips {
   max: number
   pending: boolean
   note?: string
+  /** A slot row's tap: the label is then a Button with this key and hotkey. */
+  key?: string
+  hotkey?: string
 }
 
-/** Slot rows by level, `1` → `{label: '1st'}`; pact slots last. */
-function slotRows(e: Entry): (Pips & { level: number })[] {
+/** Slot rows by level, `1` → `{label: '1st', key: 'slot-1', hotkey: '1'}`; pact slots last (`slot-pact`, `p`). */
+export function slotRows(e: Entry): (Pips & { level: number })[] {
   const used = e.sheet.spellcasting?.slots_used ?? {}
   const pending = e.derivedPending
   const rows = Object.entries((e.derived?.spell_slots ?? {}) as Record<string, number>)
     .sort(([a], [b]) => Number(a) - Number(b))
-    .map(([lvl, max]) => ({ label: ORDINAL(lvl), level: Number(lvl), max, left: Math.max(0, max - (used[lvl] ?? 0)), pending }))
+    .map(([lvl, max]) => ({ label: ORDINAL(lvl), level: Number(lvl), max, left: Math.max(0, max - (used[lvl] ?? 0)), pending, key: 'slot-' + lvl, hotkey: lvl }))
   const pact = e.derived?.pact_slots
   if (pact && typeof pact.slots === 'number') {
     const left = Math.max(0, pact.slots - (e.sheet.spellcasting?.pact_slots_used ?? 0))
-    rows.push({ label: 'Pact', level: Number(pact.level), max: pact.slots, left, pending })
+    rows.push({ label: 'Pact', level: Number(pact.level), max: pact.slots, left, pending, key: 'slot-pact', hotkey: 'p' })
   }
   return rows
 }
@@ -267,6 +274,7 @@ function buttons(el: Base, memo: Map<string, RenderElement>) {
   }
   return { make, done }
 }
+type Make = ReturnType<typeof buttons>['make']
 
 /**
  * The tab row, one row: lowercase words, a hotkey each. The open tab is marked
@@ -289,13 +297,26 @@ export function tabProps(surface: string, tab: TabId) {
   })
 }
 
-/** Pips in a table: a fixed label column, the pips, the count at a fixed column (inverse while flashing), a note. */
-function pipTable(el: Base, surface: string, rows: Pips[], labelProps: TextProps, flashing: Set<number>): RenderNode[] {
-  const labelW = Math.min(20, Math.max(1, ...rows.map((r) => r.label.length)))
+/**
+ * Pips in a table: a fixed label column, the pips, the count at a fixed column
+ * (inverse while flashing), a note. A row with a `key` draws its label as a
+ * plain Button (`1: 1st`), and the label column grows by the `1: `.
+ */
+function pipTable(el: Base, surface: string, rows: Pips[], labelProps: TextProps, flashing: Set<number>, make: Make): RenderNode[] {
+  const keyed = rows.some((r) => r.key)
+  const labelW = Math.min(20, Math.max(1, ...rows.map((r) => r.label.length)) + (keyed ? 3 : 0))
   const pipW = Math.min(17, Math.max(1, ...rows.map((r) => r.max * 2 - 1)))
   return rows.map((r, i) =>
     row(el, [
-      el.Box({ width: labelW, flexShrink: 0, children: [text(el, r.label, { ...labelProps, wrap: 'wrap' })] }),
+      el.Box({
+        width: labelW,
+        flexShrink: 0,
+        children: [
+          r.key
+            ? make({ key: r.key, label: r.label, ...(r.hotkey ? { hotkey: r.hotkey } : {}), plain: true, ...(labelProps.dimColor ? { dimColor: true } : {}) })
+            : text(el, r.label, { ...labelProps, wrap: 'wrap' }),
+        ],
+      }),
       el.Box({ width: pipW, flexShrink: 0, children: [pipsNode(el, surface, r.left, r.max, pipW, 'ink', of(r.left, r.max))] }),
       value(el, `${r.left}/${r.max}`, r.pending, flashing.has(i)),
       ...(r.note ? [dim(el, r.note)] : []),
@@ -489,7 +510,7 @@ function checkText(c: NonNullable<Entry['check']>): string {
   return `CHECK ${clock(c.at)} · ${n(c.warnings, 'WARNING')} · ${n(c.infos, 'NOTE')}`
 }
 
-const hpOf = (e: Entry) => {
+export const hpOf = (e: Entry) => {
   const hp = e.sheet.hp ?? {}
   return { current: Number(hp.current ?? 0), max: Number(hp.max ?? 0), temp: Number(hp.temp ?? 0) }
 }
@@ -547,6 +568,19 @@ export function paneTree(el: Els, v: PaneView): RenderElement {
           2,
         ),
   )
+  // The taps (register.ts): damage, heal, undo; the number field while one asks.
+  // The phone has no Input (see partyTree), so the surface is asked too.
+  kids.push(
+    wrapRow(el, [
+      make({ key: 'tap-d', label: 'dmg', hotkey: 'd', plain: true }),
+      make({ key: 'tap-h', label: 'heal', hotkey: 'h', plain: true }),
+      make({ key: 'tap-u', label: 'undo', hotkey: 'u', plain: true }),
+    ]),
+  )
+  if (v.note) kids.push(text(el, v.note, { color: TOKENS.amber, wrap: 'wrap' }))
+  if (v.tap && 'Input' in el && v.surface !== 'mobile') {
+    kids.push(el.Input({ key: 'tap-amount', label: `${v.tap.kind} · ${e.name}`, value: v.tap.text, autoFocus: true, submitLabel: 'apply', onSubmit: NOOP }))
+  }
   const pending = e.derivedPending || !e.derived
   const speeds = otherSpeeds(e.sheet)
   kids.push(
@@ -559,10 +593,10 @@ export function paneTree(el: Els, v: PaneView): RenderElement {
   const cs = casters(e)
   if (cs.length) kids.push(wrapRow(el, cs.map((c) => row(el, [dim(el, c.cls), stat(el, 'DC', c.dc, e.derivedPending), stat(el, 'ATK', c.attack, e.derivedPending)]))))
   const slots = slotRows(e)
-  if (slots.length) kids.push(ruleLine(el, 'Slots', v.columns), ...pipTable(el, v.surface, slots, { dimColor: true }, flashing(v, slots.map(slotPath))))
+  if (slots.length) kids.push(ruleLine(el, 'Slots', v.columns), ...pipTable(el, v.surface, slots, { dimColor: true }, flashing(v, slots.map(slotPath)), make))
   const res = resources(e)
   const resPaths = res.map((_, i) => new RegExp(`^/resources/${i}(/|$)`))
-  if (res.length) kids.push(ruleLine(el, 'Resources', v.columns), ...pipTable(el, v.surface, res, {}, flashing(v, resPaths)))
+  if (res.length) kids.push(ruleLine(el, 'Resources', v.columns), ...pipTable(el, v.surface, res, {}, flashing(v, resPaths), make))
 
   // The tab row and the open tab; a blank row above the tab row and the readouts
   // (freshness, then the last check's count: bookkeeping, faint unless it warns).

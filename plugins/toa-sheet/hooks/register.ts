@@ -3,9 +3,12 @@
 //
 // It watches the rules connector's own sheet_read / sheet_write results and the
 // vault's Table-log writes and session manifests, and draws what the servers
-// sent. It calls a tool itself only when the person presses `e: re-read` on the
-// party view: `$.tool.call` with the press as `consent`, checked for permission
-// like the model's own calls (README, "Re-read and permissions").
+// sent. It calls a tool itself only on a press: `e: re-read` on the party view,
+// or `n` when it starts a new round, to re-read; and the taps on the sheet view
+// (`d`, `h` and their number field, a slot's digit, `u`), each a `sheet_write`
+// at the pane's version. Each is `$.tool.call` with the press as `consent`,
+// checked for permission like the model's own calls (README, "Re-read and
+// permissions").
 //
 // It also draws the connector's rows in the transcript as receipts (receipt.ts),
 // one line each, and flashes what a write changed in the pane.
@@ -22,7 +25,7 @@ import { FLASH_MS } from './look.ts'
 import { CONNECTOR, VAULT, receipt } from './receipt.ts'
 import { asApplied, asCheck, asGet, entryAfterWrite, entryFromGet, matchEntry, payloadOf, type Entry } from './sheet.ts'
 import { applyWrite, asManifest, asTableWrite, isSessionId, rosterRows, type TableLog } from './table.ts'
-import { bandTree, detailTree, paneTree, receiptTree, RULES_KEY, TABS, tabKey, tabOf, type Adding, type Ask, type Reread, type TabId } from './view.ts'
+import { bandTree, detailTree, hpOf, paneTree, receiptTree, RULES_KEY, slotRows, TABS, tabKey, tabOf, type Adding, type Ask, type Reread, type TabId, type Tap } from './view.ts'
 
 const PANE = 'toa-sheet'
 const KEY = 'sheet:' // one $.store key per character, so sessions never overwrite each other's characters
@@ -32,8 +35,8 @@ const SESSION = 'session'
 const FIGHT = 'party:fight' // the current fight's id; its ops are under FIGHT_LOG + id
 const FIGHT_LOG = 'party:log:' // one DM, one session: the last writer wins
 const VAULT_QUERY = 'mcp__vault__vault_query'
-/** The person's own words for the press that raises the mod's calls; the engine strips it before any tool sees it. */
-const CONSENT = 'The user pressed "e: re-read" on the Party pane'
+/** The person's own words for the press that raises the mod's call; the engine strips it before any tool sees it. */
+const consent = (label: string, pane: string) => `The user pressed "${label}" on the ${pane} pane`
 
 // Module state. A reload clears it; session.start refills the sheets from $.store.
 const sheets = new Map<string, Entry>()
@@ -62,6 +65,10 @@ let sel: { row: string; member: number } | null = null
 let ask: Ask | null = null
 let adding: Adding | null = null
 let note: string | null = null
+// The sheet view's taps, never stored: the open number field, and the last tap
+// written on this machine (the version it wrote over, `from`, and the one it wrote, `to`), for `u`.
+let tap: Tap | null = null
+let lastTap: { id: string; from: number; to: number } | null = null
 
 // The receipt hook for both tool families; the mods loader takes hooks only from the top level.
 const rowHook: MatchedHook<'ui.render', { component: 'ToolUse' }> = ($, e, next) => {
@@ -187,15 +194,17 @@ async function apply($: EngineInterface, op: Op | 'undo') {
   await park($)
 }
 
+/** The note line under the party's order or the sheet's taps. */
+const say = ($: EngineInterface, text: string) => {
+  note = text
+  $.ui.invalidate('ui.render')
+}
+
 /** A key on the party view: a digit picks a row, a letter acts on the picked one. */
 async function act($: EngineInterface, key: string) {
   ask = null
   const f = live(fight())
   const row = sel ? f?.rows.find((r) => r.id === sel!.row) : undefined
-  const say = (text: string) => {
-    note = text
-    $.ui.invalidate('ui.render')
-  }
   if (key.startsWith('row-')) {
     const id = key.slice(4)
     sel = sel?.row === id && row && row.members.length > 1 ? { row: id, member: (sel.member + 1) % row.members.length } : { row: id, member: 0 }
@@ -208,14 +217,14 @@ async function act($: EngineInterface, key: string) {
   }
   if (key === 'act-f') return f ? apply($, { op: 'end' }) : undefined
   if (key === 'act-s') {
-    if (!sel) return say('pick a row: 1–9')
-    if (!sheets.has(sel.row)) return say('no sheet')
+    if (!sel) return say($, 'pick a row: 1–9')
+    if (!sheets.has(sel.row)) return say($, 'no sheet')
     focus = sel.row
     view = 'sheet'
     $.ui.invalidate('ui.render')
     return void (await $.ui.open({ id: PANE, title: focused()!.name }))
   }
-  if (!sel) return say('pick a row: 1–9')
+  if (!sel) return say($, 'pick a row: 1–9')
   const { row: id, member } = sel
   if (key === 'act-i') {
     ask = { kind: 'init', row: id, member, text: '' }
@@ -225,15 +234,15 @@ async function act($: EngineInterface, key: string) {
   if (!f) return
   const tracked = !!row && row.members.length > 0
   if (key === 'act-d' || key === 'act-h') {
-    if (!tracked) return say('no HP tracked here')
+    if (!tracked) return say($, 'no HP tracked here')
     ask = { kind: key === 'act-d' ? 'damage' : 'heal', row: id, member, text: '' }
     $.ui.invalidate('ui.render')
     return focusOn($, 'amount')
   }
-  if (key === 'act-x') return tracked ? apply($, { op: 'kill', row: id, member }) : say('no HP tracked here')
-  if (key === 'act-o') return row ? apply($, { op: 'out', row: id }) : say('not in the fight')
+  if (key === 'act-x') return tracked ? apply($, { op: 'kill', row: id, member }) : say($, 'no HP tracked here')
+  if (key === 'act-o') return row ? apply($, { op: 'out', row: id }) : say($, 'not in the fight')
   if (key === 'act-k') return apply($, { op: 'down', row: id, name: nameOf(id), value: !row?.down })
-  if (key === 'act-t') return row ? apply($, { op: 'point', row: id }) : say('not in the fight')
+  if (key === 'act-t') return row ? apply($, { op: 'point', row: id }) : say($, 'not in the fight')
 }
 
 const ADD_FIELDS = ['name', 'count', 'hp', 'ac', 'init'] as const
@@ -242,6 +251,22 @@ const num = (t: string) => (/^\d+$/.test(t.trim()) ? Number(t.trim()) : null)
 
 /** The number field and the add form: a change is kept for the redraw; a submit applies or moves on. */
 async function input($: EngineInterface, element: string, kind: 'change' | 'submit', value: string) {
+  if (element === 'tap-amount' && tap) {
+    if (kind === 'change') return void (tap = { ...tap, text: value })
+    const t = value.trim()
+    if (!t) {
+      tap = null
+      $.ui.invalidate('ui.render')
+      return focusOn($, 'tap-d')
+    }
+    const n = num(t)
+    tap = { ...tap, text: value }
+    if (n === null) {
+      note = 'a number'
+      return $.ui.invalidate('ui.render')
+    }
+    return hp($, n, value)
+  }
   if (element === 'amount' && ask) {
     if (kind === 'change') return void (ask = { ...ask, text: value })
     const t = value.trim()
@@ -278,6 +303,81 @@ async function input($: EngineInterface, element: string, kind: 'change' | 'subm
   $.ui.invalidate('ui.render')
 }
 
+/** A tap key on the sheet view: `d`/`h` open the number field, `u` undoes the last tap, a slot's digit spends one. */
+async function tapKey($: EngineInterface, key: string) {
+  const entry = focused()
+  if (!entry) return
+  if (key === 'tap-d' || key === 'tap-h') {
+    tap = { kind: key === 'tap-d' ? 'damage' : 'heal', text: '' }
+    $.ui.invalidate('ui.render')
+    return focusOn($, 'tap-amount')
+  }
+  if (key === 'tap-u') {
+    if (!lastTap || lastTap.id !== entry.id) return say($, 'nothing to undo')
+    if (entry.version !== lastTap.to) return say($, 'the sheet changed since: undo in the chat')
+    return write($, entry, { action: 'revert', changes: { version: lastTap.from } }, 'sheet pane: undo', consent('u: undo', 'Sheet'))
+  }
+  const slot = slotRows(entry).find((s) => s.key === key)
+  if (!slot) return
+  const pact = key === 'slot-pact'
+  const name = pact ? 'pact' : slot.label
+  if (slot.left <= 0) return say($, `no ${name} slots left`)
+  const spell = entry.sheet.spellcasting ?? {}
+  const used = Number(pact ? spell.pact_slots_used ?? 0 : spell.slots_used?.[String(slot.level)] ?? 0)
+  const changes = pact ? { spellcasting: { pact_slots_used: used + 1 } } : { spellcasting: { slots_used: { [String(slot.level)]: used + 1 } } }
+  return write($, entry, { action: 'update', changes }, `sheet pane: ${name} slot`, consent(`${slot.hotkey}: ${slot.label}`, 'Sheet'))
+}
+
+/** The number field's `n`: damage spends temp HP first, then HP down to 0; healing raises HP up to the max the pane draws. */
+async function hp($: EngineInterface, n: number, typed: string) {
+  const entry = focused()
+  if (!entry || !tap) return
+  const { current, max, temp } = hpOf(entry)
+  const damage = tap.kind === 'damage'
+  if (n === 0 || (damage && current <= 0 && temp <= 0) || (!damage && current >= max)) return say($, 'nothing to change')
+  const t = damage ? Math.min(temp, n) : 0
+  const changes = damage
+    ? { hp: { current: Math.max(0, current - (n - t)), ...(t ? { temp: temp - t } : {}) } }
+    : { hp: { current: Math.min(max, current + n) } }
+  const said = `The user entered "${typed.trim()}" in "${tap.kind} · ${entry.name}" on the Sheet pane and pressed apply`
+  return write($, entry, { action: 'update', changes }, `sheet pane: ${damage ? '−' : '+'}${n} HP`, said)
+}
+
+/**
+ * One tap's `sheet_write`, applied at once at the pane's version: the
+ * connector's `base_version` guard is the stale check. The watcher caches and
+ * flashes the result; a refusal or an error is the note, and the field stays.
+ */
+async function write($: EngineInterface, entry: Entry, body: Record<string, unknown>, reason: string, said: string) {
+  const tool = 'mcp__' + entry.server + '__sheet_write'
+  const from = entry.version
+  try {
+    if (!(await $.tool.list()).some((t) => t.name === tool)) return say($, 'no sheet_write tool in this session')
+    // The name is built at run time, so it is no literal the declarations know.
+    const r = await $.tool.call({ tool, request: { ...body, character: entry.id, base_version: from, reason }, apply: true, consent: said } as ToolCallArgs)
+    if ('deny' in r) {
+      $.ui.log(`tap: ${tool} refused: ` + firstLine(r.deny))
+      return say($, `refused: allow ${tool} (/permissions)`)
+    }
+    if (r.isError) {
+      if (!/sheet changed/i.test(String(r.text))) return say($, firstLine(r.text))
+      // The watcher re-caches the sheet, so the next Enter recomputes at its version.
+      const read = 'mcp__' + entry.server + '__sheet_read'
+      await $.tool.call({ tool: read, request: { action: 'get', character: entry.id }, consent: said } as ToolCallArgs)
+      return say($, 'the sheet changed · try again')
+    }
+    const p = payloadOf(r)
+    const wrote = p && 'data' in p ? asApplied(p.data) : null
+    lastTap = body.action !== 'revert' && wrote ? { id: entry.id, from, to: wrote.version } : null
+  } catch (err) {
+    return say($, firstLine(message(err)))
+  }
+  tap = null
+  note = null
+  $.ui.invalidate('ui.render')
+  await focusOn($, 'tap-d')
+}
+
 async function saveLog($: EngineInterface, log: TableLog) {
   logs.set(log.session, log)
   $.ui.invalidate('ui.render')
@@ -294,10 +394,12 @@ async function update($: EngineInterface, entry: Entry) {
 
 /** Keep `entry` and show it: focus it, and open the pane (or toast) the first time. */
 async function remember($: EngineInterface, entry: Entry) {
-  focus = entry.id
+  // A re-read refreshes the cache only: the sheet on show stays the one the DM picked, even mid-sweep.
+  const move = !rereading || !focus
+  if (move) focus = entry.id
   seenHere = true
   await update($, entry)
-  await $.store.set(LAST, entry.id)
+  if (move) await $.store.set(LAST, entry.id)
   if (!paneOpen && !dismissed && !autoTried) {
     autoTried = true
     // Unasked, so Claude Code places it only where it fits (144 columns, 110 once opened).
@@ -361,16 +463,17 @@ async function watchVault($: EngineInterface, e: any, result: unknown) {
 }
 
 /**
- * The re-read, on the `e` press only: the connector's `list`, then a `get` per
- * id, one at a time (a dialog each in default mode, never several at once), then
- * the session's manifest. The watchers cache the answers; this reads only
- * whether each call answered.
+ * The re-read, on `e` and on `n` into a new round, one sweep at a time: the
+ * connector's `list`, then a `get` per id, one at a time (a dialog each in
+ * default mode, never several at once), then the session's manifest. The
+ * watchers cache the answers; this reads only whether each call answered.
  */
-async function refresh($: EngineInterface) {
-  const was = focus
+async function refresh($: EngineInterface, pressed: string) {
+  if (rereading) return
+  rereading = true
   const call = async (tool: string, request: Record<string, unknown>) => {
     // The name is found at run time, so it is no literal the declarations know.
-    const r = await $.tool.call({ tool, request, consent: CONSENT } as ToolCallArgs)
+    const r = await $.tool.call({ tool, request, consent: pressed } as ToolCallArgs)
     if ('deny' in r || r.isError) {
       $.ui.log(`re-read: ${tool} refused: ` + firstLine('deny' in r ? r.deny : r.text))
       reread = { refused: tool }
@@ -398,10 +501,7 @@ async function refresh($: EngineInterface) {
   } catch (err) {
     reread = { failed: firstLine(message(err)) }
   } finally {
-    if (was && sheets.has(was) && focus !== was) {
-      focus = was
-      await $.store.set(LAST, was)
-    }
+    rereading = false
     $.ui.invalidate('ui.render')
   }
 }
@@ -476,7 +576,7 @@ export function register(on: On) {
     return {}
   })
 
-  // `/party [S04]`: the party view, drawn from the cache. It calls no tool: only `e` re-reads.
+  // `/party [S04]`: the party view, drawn from the cache. It calls no tool: only `e`, or `n` into a new round, re-reads.
   on('command.run', { command: 'party' }, async ($, e) => {
     const arg = String(e.args ?? '').trim().toUpperCase()
     if (isSessionId(arg)) {
@@ -526,10 +626,11 @@ export function register(on: On) {
       ask: ask && { ...ask, name: nameOf(ask.row) },
       adding,
       note,
+      tap,
     })
   })
 
-  // The party view's number field (`amount`) and add form (`add-*`).
+  // The party view's number field (`amount`) and add form (`add-*`); the sheet view's (`tap-amount`).
   on('ui.input', { plugin: 'toa-sheet' }, async ($, e, next) => {
     await input($, String(e.element), e.kind, e.value)
     return next(e)
@@ -552,7 +653,7 @@ export function register(on: On) {
   })
 
   // The pane's presses: a tab, the DM-rules badge (which opens Notes), the party
-  // button, the fight's keys (a row, an action, next, undo), the re-read. The
+  // button, the sheet's taps, the fight's keys (a row, an action, next, undo), the re-read. The
   // Buttons' own closures do nothing, so a kept Button never acts on stale state.
   on('ui.press', { plugin: 'toa-sheet' }, async ($, e, next) => {
     const id = String(e.element)
@@ -562,18 +663,19 @@ export function register(on: On) {
       await $.ui.open({ id: PANE, title: 'Party', columns: 60 })
     } else if (id.startsWith('row-') || id.startsWith('act-')) {
       await act($, id)
+    } else if (id.startsWith('tap-') || id.startsWith('slot-')) {
+      await tapKey($, id)
     } else if (id === 'next' && live(fight())) {
+      const was = fight()!.round
       await apply($, { op: 'next' })
+      // A new round re-reads the sheets, so HP the players wrote shows. Awaited, as `e`'s is: the mod's own
+      // watcher sees only the calls made while the press is in flight.
+      if ((fight()?.round ?? 0) > was) await refresh($, consent('n: next', 'Party') + ', which starts a new round and re-reads')
     } else if (id === 'undo') {
       // Also after `f`: undoing the end brings the fight back.
       await apply($, 'undo')
-    } else if (id === 'reread' && !rereading) {
-      rereading = true
-      try {
-        await refresh($)
-      } finally {
-        rereading = false
-      }
+    } else if (id === 'reread') {
+      await refresh($, consent('e: re-read', 'Party'))
     }
     const hit = TABS.find((t) => tabKey(t.id) === e.element)?.id ?? (e.element === RULES_KEY ? 'notes' : null)
     if (hit && hit !== tab) {
