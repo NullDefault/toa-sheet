@@ -10,26 +10,26 @@
 // It also draws the connector's rows in the transcript as receipts (receipt.ts),
 // one line each, and flashes what a write changed in the pane.
 //
-// The party view's entry line is the DM's fight (fight.ts): each applied line
-// is stored as typed, and the fight drawn is their fold.
+// The party view's keys are the DM's fight (fight.ts): a digit picks a row, a
+// letter acts on it, and each applied op is stored; the fight drawn is their fold.
 //
 // Mods API calls: $.ui, $.store, $.command, $.clock, $.tool only. Every call
 // lives in this file; sheet.ts, table.ts, look.ts, receipt.ts and view.ts are pure.
 
 import type { EngineInterface, MatchedHook, On, RenderElement, ToolCallArgs } from 'claude-code'
-import { fold, parseLine, undoTarget, type Event, type Fight } from './fight.ts'
+import { fold, live, undoTarget, type Event, type Fight, type Op } from './fight.ts'
 import { FLASH_MS } from './look.ts'
 import { CONNECTOR, VAULT, receipt } from './receipt.ts'
 import { asApplied, asCheck, asGet, entryAfterWrite, entryFromGet, matchEntry, payloadOf, type Entry } from './sheet.ts'
 import { applyWrite, asManifest, asTableWrite, isSessionId, rosterRows, type TableLog } from './table.ts'
-import { bandTree, detailTree, paneTree, receiptTree, RULES_KEY, TABS, tabKey, tabOf, type Reread, type TabId } from './view.ts'
+import { bandTree, detailTree, paneTree, receiptTree, RULES_KEY, TABS, tabKey, tabOf, type Adding, type Ask, type Reread, type TabId } from './view.ts'
 
 const PANE = 'toa-sheet'
 const KEY = 'sheet:' // one $.store key per character, so sessions never overwrite each other's characters
 const LAST = 'last'
 const TABLE = 'table:' // one $.store key per session's log
 const SESSION = 'session'
-const FIGHT = 'party:fight' // the current fight's id; its typed lines are under FIGHT_LOG + id
+const FIGHT = 'party:fight' // the current fight's id; its ops are under FIGHT_LOG + id
 const FIGHT_LOG = 'party:log:' // one DM, one session: the last writer wins
 const VAULT_QUERY = 'mcp__vault__vault_query'
 /** The person's own words for the press that raises the mod's calls; the engine strips it before any tool sees it. */
@@ -54,10 +54,14 @@ let session: string | null = null // the session the party view follows: `/party
 const logs = new Map<string, TableLog>()
 let reread: Reread | null = null // the last re-read's outcome, never stored
 let rereading = false
-let fightEvents: Event[] = [] // the current fight's typed lines and undos, as stored
+let fightEvents: Event[] = [] // the current fight's ops and undos, as stored
 let fightId: string | null = null
-let typed = '' // the entry line's text, kept across redraws
-let refused: string | null = null // why the last line was refused, until one applies
+// The DM's hand on the party view, never stored: the picked row, the open number
+// field or add form, and the amber note (why the last key did nothing).
+let sel: { row: string; member: number } | null = null
+let ask: Ask | null = null
+let adding: Adding | null = null
+let note: string | null = null
 
 // The receipt hook for both tool families; the mods loader takes hooks only from the top level.
 const rowHook: MatchedHook<'ui.render', { component: 'ToolUse' }> = ($, e, next) => {
@@ -86,9 +90,28 @@ function storedLog(v: unknown): TableLog | null {
   return l
 }
 
+const int = (v: unknown) => Number.isInteger(v)
+const intOrNull = (v: unknown) => v === null || Number.isInteger(v)
+const str = (v: unknown) => typeof v === 'string'
+
+function storedOp(o: any): boolean {
+  if (!o || typeof o !== 'object') return false
+  switch (o.op) {
+    case 'add': return str(o.name) && int(o.count) && intOrNull(o.hp) && intOrNull(o.ac) && intOrNull(o.init)
+    case 'init': return str(o.row) && str(o.name) && int(o.value)
+    case 'hp': return str(o.row) && int(o.member) && int(o.delta)
+    case 'kill': return str(o.row) && int(o.member)
+    case 'out': case 'point': return str(o.row)
+    case 'down': return str(o.row) && str(o.name) && typeof o.value === 'boolean'
+    case 'next': case 'end': return true
+    default: return false
+  }
+}
+
+/** A stored fight log, or null: anything else (T0055's lines among it) starts the fight empty. */
 function storedEvents(v: unknown): Event[] | null {
   if (!Array.isArray(v)) return null
-  const ok = v.every((e) => e && typeof e === 'object' && typeof e.at === 'number' && (typeof e.line === 'string' || typeof e.undo === 'number'))
+  const ok = v.every((e) => e && typeof e === 'object' && typeof e.at === 'number' && (int(e.undo) || storedOp(e.op)))
   return ok ? (v as Event[]) : null
 }
 
@@ -109,38 +132,45 @@ async function loadStore($: EngineInterface) {
   if (!session && typeof stored === 'string') session = stored
   const id = await $.store.get(FIGHT)
   if (!fightId && typeof id === 'string') {
-    fightId = id
-    fightEvents = storedEvents(await $.store.get(FIGHT_LOG + id)) ?? []
+    const events = storedEvents(await $.store.get(FIGHT_LOG + id)) ?? []
+    // Only a live fight comes back: `u` undoes an end within the sitting, never an old fight's.
+    if (live(fold(events))) {
+      fightId = id
+      fightEvents = events
+    }
   }
 }
 
-const pcs = () => rosterRows([...sheets.values()]).map((e) => ({ id: e.id, name: e.name }))
-const fight = (): Fight | null => fold(fightEvents, pcs())
+const fight = (): Fight | null => fold(fightEvents)
+const nameOf = (id: string) => live(fight())?.rows.find((r) => r.id === id)?.name ?? sheets.get(id)?.name ?? id
+
+/** Put the keyboard on `key`; an element never drawn (no Input on mobile, the pane closed) answers deny, and the hotkeys still work. */
+async function focusOn($: EngineInterface, key: string) {
+  try {
+    await $.ui.focus({ requestId: PANE, key })
+  } catch {
+    // not drawn here
+  }
+}
+
+/** Park the ring on `next`, a Button, so the hotkeys work again: the way back from a field. */
+const park = ($: EngineInterface) => focusOn($, 'next')
 
 /**
- * One line from the entry field (or `n`/`u` pressed): refused and nothing
- * changes, or stored and drawn. A line that starts a new fight starts a new
- * log; the old one stays in the store.
+ * One op pressed (or `undo`): stored and drawn. An op that starts a new fight
+ * starts a new log; the old one stays in the store.
  */
-async function apply($: EngineInterface, typedLine: string) {
-  const line = typedLine.trim().slice(0, 160)
+async function apply($: EngineInterface, op: Op | 'undo') {
   const at = await $.clock.now()
   let event: Event
-  if (/^(u|undo)$/i.test(line)) {
+  if (op === 'undo') {
     const target = undoTarget(fightEvents)
     if (target === null) {
-      refused = 'nothing to undo'
+      note = 'nothing to undo'
       return $.ui.invalidate('ui.render')
     }
     event = { at, undo: target }
-  } else {
-    const ops = parseLine(line, { pcs: pcs(), fight: fight() })
-    if ('refused' in ops) {
-      refused = ops.refused
-      return $.ui.invalidate('ui.render')
-    }
-    event = { at, line, source: 'dm' }
-  }
+  } else event = { at, op }
   fightEvents = [...fightEvents, event]
   const f = fight()
   if (f && f.id !== fightId) {
@@ -149,13 +179,103 @@ async function apply($: EngineInterface, typedLine: string) {
     await $.store.set(FIGHT, fightId)
   }
   if (fightId) await $.store.set(FIGHT_LOG + fightId, fightEvents)
-  refused = null
+  const row = sel && live(f)?.rows.find((r) => r.id === sel!.row)
+  sel = row && sel ? { row: row.id, member: Math.max(0, Math.min(sel.member, row.members.length - 1)) } : null
+  note = null
+  ask = null
   $.ui.invalidate('ui.render')
-  try {
-    await $.ui.focus({ requestId: PANE, key: 'entry' })
-  } catch {
-    // The field is not drawn here (no Input, or the pane is closed): the hotkeys still work.
+  await park($)
+}
+
+/** A key on the party view: a digit picks a row, a letter acts on the picked one. */
+async function act($: EngineInterface, key: string) {
+  ask = null
+  const f = live(fight())
+  const row = sel ? f?.rows.find((r) => r.id === sel!.row) : undefined
+  const say = (text: string) => {
+    note = text
+    $.ui.invalidate('ui.render')
   }
+  if (key.startsWith('row-')) {
+    const id = key.slice(4)
+    sel = sel?.row === id && row && row.members.length > 1 ? { row: id, member: (sel.member + 1) % row.members.length } : { row: id, member: 0 }
+    return $.ui.invalidate('ui.render')
+  }
+  if (key === 'act-a') {
+    adding = adding ? null : { name: '', count: '', hp: '', ac: '', init: '' }
+    $.ui.invalidate('ui.render')
+    return adding ? focusOn($, 'add-name') : undefined
+  }
+  if (key === 'act-f') return f ? apply($, { op: 'end' }) : undefined
+  if (key === 'act-s') {
+    if (!sel) return say('pick a row: 1–9')
+    if (!sheets.has(sel.row)) return say('no sheet')
+    focus = sel.row
+    view = 'sheet'
+    $.ui.invalidate('ui.render')
+    return void (await $.ui.open({ id: PANE, title: focused()!.name }))
+  }
+  if (!sel) return say('pick a row: 1–9')
+  const { row: id, member } = sel
+  if (key === 'act-i') {
+    ask = { kind: 'init', row: id, member, text: '' }
+    $.ui.invalidate('ui.render')
+    return focusOn($, 'amount')
+  }
+  if (!f) return
+  const tracked = !!row && row.members.length > 0
+  if (key === 'act-d' || key === 'act-h') {
+    if (!tracked) return say('no HP tracked here')
+    ask = { kind: key === 'act-d' ? 'damage' : 'heal', row: id, member, text: '' }
+    $.ui.invalidate('ui.render')
+    return focusOn($, 'amount')
+  }
+  if (key === 'act-x') return tracked ? apply($, { op: 'kill', row: id, member }) : say('no HP tracked here')
+  if (key === 'act-o') return row ? apply($, { op: 'out', row: id }) : say('not in the fight')
+  if (key === 'act-k') return apply($, { op: 'down', row: id, name: nameOf(id), value: !row?.down })
+  if (key === 'act-t') return row ? apply($, { op: 'point', row: id }) : say('not in the fight')
+}
+
+const ADD_FIELDS = ['name', 'count', 'hp', 'ac', 'init'] as const
+/** A numeric add field: an integer, or null when blank (or not a number). */
+const num = (t: string) => (/^\d+$/.test(t.trim()) ? Number(t.trim()) : null)
+
+/** The number field and the add form: a change is kept for the redraw; a submit applies or moves on. */
+async function input($: EngineInterface, element: string, kind: 'change' | 'submit', value: string) {
+  if (element === 'amount' && ask) {
+    if (kind === 'change') return void (ask = { ...ask, text: value })
+    const t = value.trim()
+    if (!t) {
+      ask = null
+      $.ui.invalidate('ui.render')
+      return park($)
+    }
+    const n = num(t)
+    if (n === null) {
+      ask = { ...ask, text: value }
+      note = 'a number'
+      return $.ui.invalidate('ui.render')
+    }
+    const { kind: what, row, member } = ask
+    return apply($, what === 'init' ? { op: 'init', row, name: nameOf(row), value: n } : { op: 'hp', row, member, delta: what === 'damage' ? -n : n })
+  }
+  const field = ADD_FIELDS.find((k) => element === 'add-' + k)
+  if (!field || !adding) return
+  adding = { ...adding, [field]: value }
+  if (kind === 'change') return
+  if (field !== 'init') return focusOn($, 'add-' + ADD_FIELDS[ADD_FIELDS.indexOf(field) + 1])
+  const name = adding.name.trim()
+  if (!name) {
+    note = 'a name'
+    $.ui.invalidate('ui.render')
+    return focusOn($, 'add-name')
+  }
+  const op: Op = { op: 'add', name: name.charAt(0).toUpperCase() + name.slice(1), count: Math.max(1, num(adding.count) ?? 1), hp: num(adding.hp), ac: num(adding.ac), init: num(adding.init) }
+  adding = null
+  await apply($, op)
+  const added = fight()?.rows.find((r) => r.added === fightEvents.length - 1)
+  if (added) sel = { row: added.id, member: 0 }
+  $.ui.invalidate('ui.render')
 }
 
 async function saveLog($: EngineInterface, log: TableLog) {
@@ -181,7 +301,8 @@ async function remember($: EngineInterface, entry: Entry) {
   if (!paneOpen && !dismissed && !autoTried) {
     autoTried = true
     // Unasked, so Claude Code places it only where it fits (144 columns, 110 once opened).
-    const placed = await $.ui.open({ id: PANE, title: entry.name })
+    // Esc closes it, as `/sheet`'s does: a player who never typed `/sheet` needs a way out.
+    const placed = await $.ui.open({ id: PANE, title: entry.name, closeOnEscape: true })
     if (placed && placed.isPlaced) paneOpen = true
   }
   if (!paneOpen && !toasted) {
@@ -401,21 +522,17 @@ export function register(on: On) {
       now,
       flash: flashing,
       fight: fight(),
-      typed,
-      refused,
+      sel,
+      ask: ask && { ...ask, name: nameOf(ask.row) },
+      adding,
+      note,
     })
   })
 
-  // The party view's entry line: a change is kept so a redraw keeps it; a submit is applied and clears it.
-  on('ui.input', { plugin: 'toa-sheet', element: 'entry' }, async ($, e, next) => {
-    if (e.kind === 'change') {
-      typed = e.value
-      return next(e)
-    }
-    await apply($, e.value)
-    // A refused line stays in the field to be fixed, not retyped.
-    typed = refused ? e.value : ''
-    return next({ ...e, value: typed })
+  // The party view's number field (`amount`) and add form (`add-*`).
+  on('ui.input', { plugin: 'toa-sheet' }, async ($, e, next) => {
+    await input($, String(e.element), e.kind, e.value)
+    return next(e)
   })
 
   // Connector and vault calls fold into one "Called … n times" line. The matcher selects only
@@ -435,21 +552,21 @@ export function register(on: On) {
   })
 
   // The pane's presses: a tab, the DM-rules badge (which opens Notes), the party
-  // button, a party row (its sheet), the re-read. The Buttons' own closures do
-  // nothing, so a kept Button never acts on stale state.
+  // button, the fight's keys (a row, an action, next, undo), the re-read. The
+  // Buttons' own closures do nothing, so a kept Button never acts on stale state.
   on('ui.press', { plugin: 'toa-sheet' }, async ($, e, next) => {
     const id = String(e.element)
     if (id === 'view-party') {
       view = 'party'
       $.ui.invalidate('ui.render')
       await $.ui.open({ id: PANE, title: 'Party', columns: 60 })
-    } else if (id.startsWith('pc-') && sheets.has(id.slice(3))) {
-      focus = id.slice(3)
-      view = 'sheet'
-      $.ui.invalidate('ui.render')
-      await $.ui.open({ id: PANE, title: focused()!.name })
-    } else if (id === 'next' || id === 'undo') {
-      await apply($, id === 'next' ? 'n' : 'u')
+    } else if (id.startsWith('row-') || id.startsWith('act-')) {
+      await act($, id)
+    } else if (id === 'next' && live(fight())) {
+      await apply($, { op: 'next' })
+    } else if (id === 'undo') {
+      // Also after `f`: undoing the end brings the fight back.
+      await apply($, 'undo')
     } else if (id === 'reread' && !rereading) {
       rereading = true
       try {

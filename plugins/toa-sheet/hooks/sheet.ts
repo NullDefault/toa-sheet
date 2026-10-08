@@ -258,7 +258,8 @@ export function pathLabel(path: string, sheet: Record<string, any>): string {
 /** One line for the last change: `HP 12 → 15 · long rest`. */
 export function describeChange(c: Change, sheet: Record<string, any>): string {
   const v = (x: unknown) => (x === undefined ? '∅' : x !== null && typeof x === 'object' ? '…' : String(x))
-  const parts = c.diff.slice(0, 3).map((d) => pathLabel(d.path, sheet) + ' ' + v(d.from) + ' → ' + v(d.to))
+  // A key the write created has no `from`: `slot 1 used → 1`, not `∅ → 1`.
+  const parts = c.diff.slice(0, 3).map((d) => pathLabel(d.path, sheet) + (d.from === undefined ? '' : ' ' + v(d.from)) + ' → ' + v(d.to))
   if (c.diff.length > 3) parts.push('+' + (c.diff.length - 3) + ' more')
   return parts.join(', ') + (c.reason ? ' · ' + c.reason : '')
 }

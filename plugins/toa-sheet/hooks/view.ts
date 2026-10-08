@@ -17,12 +17,12 @@
 //
 // The party view (`/party`, the DM's) is a second tree in the same pane: a row
 // per cached sheet, the Table log as seen here, the session, the re-read. While
-// a fight is on (fight.ts), its order is drawn above the party; the entry line
-// the DM types it in sits at the bottom.
+// a fight is on (fight.ts), its order is drawn above the party; the DM runs it
+// with keys: a digit on each row, a letter for each action.
 
 import type { ButtonProps, Elements, RenderElement, RenderNode, TextProps } from 'claude-code'
 import { actionGroups, type ActionRow } from './actions.ts'
-import { GRAMMAR, live, orderRows, statusText, type Fight, type Member, type Row } from './fight.ts'
+import { live, orderRows, statusText, type Fight, type Member, type Row } from './fight.ts'
 import { describeChange, type Entry } from './sheet.ts'
 import { bandSegments, gaugeRuns, hpSegments, hpState, pipRuns, RECEIPT_INDENT, rule, TOKENS, type Run, type Segment, type Tone } from './look.ts'
 import { cellsSvg, hpSvg, pipsSvg, type Art } from './pixel.ts'
@@ -57,6 +57,10 @@ export const tabKey = (id: TabId) => 'tab-' + id
 
 /** The last re-read: `sheets` the gets that answered, `listed` the list answer's length. Module state, never stored. */
 export type Reread = { at: number; sheets: number; listed: number } | { refused: string } | { failed: string }
+/** The number field's question: which number, for which row and member, and its text so far. */
+export type Ask = { kind: 'damage' | 'heal' | 'init'; row: string; member: number; text: string }
+/** The add form's five fields, as the DM has filled them so far. */
+export type Adding = { name: string; count: string; hp: string; ac: string; init: string }
 
 export interface PaneView {
   view: 'sheet' | 'party'
@@ -82,11 +86,27 @@ export interface PaneView {
   flash: string[] | null
   /** The DM's fight, or null; drawn on the party view until it ends. */
   fight: Fight | null
-  /** The entry line's text as typed, so a redraw keeps a half-typed line. */
-  typed: string
-  /** Why the last typed line was refused, until a line applies. */
-  refused: string | null
+  /** The picked row (by id) and, in a group, its member. */
+  sel: { row: string; member: number } | null
+  /** The open number field, with the row's name for its label. */
+  ask: (Ask & { name: string }) | null
+  /** The open add form. */
+  adding: Adding | null
+  /** Why the last key did nothing, until an op applies. */
+  note: string | null
 }
+
+/** The fight's keys, in the key row's order: [element key, hotkey, label]. */
+const FIGHT_KEYS = [
+  ['next', 'n', 'next'], ['undo', 'u', 'undo'], ['act-d', 'd', 'dmg'], ['act-h', 'h', 'heal'], ['act-i', 'i', 'init'],
+  ['act-x', 'x', 'kill'], ['act-o', 'o', 'out'], ['act-k', 'k', 'down'], ['act-t', 't', 'turn'], ['act-f', 'f', 'end'], ['act-a', 'a', 'add'],
+] as const
+/** With no fight: `a add · i init`, and `u undo` while the last fight's end can be undone. */
+const IDLE_KEYS = [FIGHT_KEYS[10], FIGHT_KEYS[4]]
+const ENDED_KEYS = [...IDLE_KEYS, FIGHT_KEYS[1]]
+const ADD_FIELDS = [
+  ['name', ''], ['count', '1'], ['hp', 'blank: no HP tracked'], ['ac', ''], ['init', ''],
+] as const
 
 const signed = (n: unknown) => (typeof n === 'number' ? (n >= 0 ? '+' + n : String(n)) : '?')
 const pad2 = (n: number) => String(n).padStart(2, '0')
@@ -590,10 +610,12 @@ function rereadText(v: PaneView): string | null {
  * sheet not confirmed in the last 15 minutes is drawn hollow: its current HP
  * unknown, the gauge empty, its freshness under the name.
  *
- * While a fight is on, the status line, the last typed line and `next`/`undo`
- * take the log state's place, and `── ORDER` comes above `── PARTY`: the PCs in
- * the fight move into it, so none is drawn twice. The entry line is last, where
- * the surface has `Input`; the grammar beneath it after a refusal or with no fight.
+ * While a fight is on, the status line, the last op and the key row take the
+ * log state's place, and `── ORDER` comes above `── PARTY`: the PCs in the
+ * fight move into it, so none is drawn twice. Every row's name is a Button with
+ * a digit, in drawn order (Order first), so the digits renumber as the order
+ * moves; the digit is drawn beside the name. The number field and the add form
+ * are drawn only while asked, where the surface has `Input`.
  */
 function partyTree(el: Els, v: PaneView): RenderElement {
   const { make, done } = buttons(el, v.memo)
@@ -610,15 +632,49 @@ function partyTree(el: Els, v: PaneView): RenderElement {
     kids.push(text(el, statusText(f), { wrap: 'wrap' }))
     const last = f.log[f.log.length - 1]
     if (last) kids.push(dim(el, `${clock(last.at)}  ${last.text}` + (last.working ? `  ${last.working}` : '') + (last.reverted ? '  undone' : '')))
-    kids.push(row(el, [make({ key: 'next', label: 'next', hotkey: 'n', plain: true }), make({ key: 'undo', label: 'undo', hotkey: 'u', plain: true })], 2))
   } else if (state) kids.push(text(el, state, { dimColor: true, wrap: 'wrap' }))
+  const picked = v.sel && v.rows.some((e) => e.id === v.sel!.row)
+  const keys = [...(f ? FIGHT_KEYS : v.fight?.ended ? ENDED_KEYS : IDLE_KEYS), ...(picked ? [['act-s', 's', 'sheet'] as const] : [])]
+  kids.push(wrapRow(el, keys.map(([key, hotkey, label]) => make({ key, label, hotkey, plain: true }))))
+  if (v.note) kids.push(text(el, v.note, { color: TOKENS.amber, wrap: 'wrap' }))
+  // The number field and the add form: the ui.input hook in register.ts takes
+  // what is entered. The phone's table has no Input (Elements['mobile']), but
+  // resolve hands it one that draws an empty Box, so the surface is asked too.
+  if ('Input' in el && v.surface !== 'mobile') {
+    if (v.ask) {
+      const members = f?.rows.find((r) => r.id === v.ask!.row)?.members.length ?? 0
+      const who = members > 1 ? `${v.ask.name} ${v.ask.member + 1} of ${members}` : v.ask.name
+      const submitLabel = v.ask.kind === 'init' ? 'set' : 'apply'
+      kids.push(el.Input({ key: 'amount', label: `${v.ask.kind} · ${who}`, value: v.ask.text, autoFocus: true, submitLabel, onSubmit: NOOP }))
+    }
+    if (v.adding) {
+      const form = v.adding
+      for (const [field, placeholder] of ADD_FIELDS) {
+        kids.push(
+          el.Input({
+            key: 'add-' + field,
+            label: field,
+            ...(placeholder ? { placeholder } : {}),
+            value: form[field],
+            ...(field === 'name' ? { autoFocus: true } : {}),
+            submitLabel: field === 'init' ? 'add' : 'next',
+            onSubmit: NOOP,
+          }),
+        )
+      }
+    }
+  }
 
-  /** A PC's name as the party view's button, hotkey 1–9 by roster position, padded to `w`. */
-  const pcButton = (e: Entry, w: number) => {
-    const i = v.rows.indexOf(e)
-    const name = e.name.slice(0, w)
-    const pad = w - name.length
-    return row(el, [make({ key: 'pc-' + e.id, label: name, ...(i < 9 ? { hotkey: String(i + 1) } : {}), plain: true }), ...(pad ? [text(el, ' '.repeat(pad))] : [])], 0)
+  // Every row's name is a Button with the next digit, 1–9 in drawn order.
+  let digit = 0
+  /** A row's name as its button, padded to `w` and a column for the picked one's `▸` (a plain Button draws no variant on the terminal). */
+  const nameButton = (id: string, label: string, w: number) => {
+    digit++
+    const on = v.sel?.row === id
+    const name = (on ? '▸' : '') + label.slice(0, w)
+    const pad = w + 1 - name.length
+    const props = { key: 'row-' + id, label: name, ...(digit <= 9 ? { hotkey: String(digit) } : {}), plain: true as const, ...(on ? { variant: 'primary' as const } : {}) }
+    return row(el, [make(props), ...(pad > 0 ? [text(el, ' '.repeat(pad))] : [])], 0)
   }
   /** A PC's HP and gauge, from the sheet; hollow when stale. */
   const pcHp = (e: Entry): RenderNode[] => {
@@ -647,17 +703,16 @@ function partyTree(el: Els, v: PaneView): RenderElement {
     kids.push(ruleLine(el, 'Order', v.columns))
     const order = orderRows(f)
     const sheetOf = (r: Row) => (r.side === 'pc' ? v.rows.find((e) => e.id === r.id) : undefined)
-    const drawn = (r: Row) => sheetOf(r)?.name ?? (r.members.length > 1 ? `${r.name} ×${r.members.length}` : r.name)
-    const w = Math.min(14, Math.max(1, ...order.map((r) => drawn(r).length)))
+    const suffix = (r: Row) => (r.members.length > 1 ? ` ×${r.members.length}` : '')
+    const base = (r: Row) => sheetOf(r)?.name ?? r.name
+    const w = Math.min(14, Math.max(1, ...order.map((r) => base(r).length + suffix(r).length)))
+    /** The name cut to the column, keeping a group's ` ×N`. */
+    const fit = (r: Row) => base(r).slice(0, w - suffix(r).length) + suffix(r)
     for (const r of order) {
       const e = sheetOf(r)
       const acting = f.pointer === r.id
-      const name = drawn(r).slice(0, w)
-      const sheetAc = e ? String(e.sheet.ac?.value ?? '?') : '?'
-      const ac =
-        r.side === 'pc' && r.ac !== null
-          ? row(el, [dim(el, 'AC'), row(el, [text(el, sheetAc + '→'), value(el, String(r.ac))], 0)])
-          : stat(el, 'AC', r.side === 'pc' ? sheetAc : r.ac === null ? '?' : String(r.ac))
+      const on = v.sel?.row === r.id
+      const ac = stat(el, 'AC', e ? String(e.sheet.ac?.value ?? '?') : r.ac === null ? '?' : String(r.ac))
       kids.push(
         el.Box({
           flexDirection: 'row',
@@ -666,17 +721,19 @@ function partyTree(el: Els, v: PaneView): RenderElement {
           children: [
             row(el, [
               text(el, (acting ? '▶ ' : '  ') + (r.init === null ? '?' : String(r.init)).padStart(2)),
-              r.side === 'pc' ? text(el, '◆', { color: TOKENS.phosphor }) : text(el, '▲', { dimColor: true }),
-              e ? pcButton(e, w) : text(el, name.padEnd(w), { wrap: 'truncate', ...(acting ? { bold: true } : {}) }),
+              // No members: no HP tracked, which tonight is a player without a sheet.
+              r.side === 'pc' || !r.members.length ? text(el, '◆', { color: TOKENS.phosphor }) : text(el, '▲', { dimColor: true }),
+              nameButton(r.id, fit(r), w),
             ]),
             ac,
-            ...(e ? pcHp(e) : r.side === 'monster' ? monsterHp(el, v.surface, r) : []),
+            ...(e ? pcHp(e) : r.members.length ? monsterHp(el, v.surface, r, on ? v.sel!.member : null) : []),
+            ...(on && r.members.length > 1 ? [dim(el, 'press again: next member')] : []),
             ...(r.down ? [text(el, '▒DOWN▒', { color: TOKENS.amber, inverse: true, bold: true })] : []),
             ...(r.out ? [dim(el, 'OUT')] : []),
           ],
         }),
       )
-      if (e) kids.push(...pcNotes(e, w + 12))
+      if (e) kids.push(...pcNotes(e, w + 13))
     }
   }
 
@@ -690,13 +747,13 @@ function partyTree(el: Els, v: PaneView): RenderElement {
         flexWrap: 'wrap',
         columnGap: 2,
         children: [
-          pcButton(e, nameW),
+          nameButton(e.id, e.name, nameW),
           stat(el, 'AC', String(e.sheet.ac?.value ?? '?')),
           ...pcHp(e),
           stat(el, 'PP', String(e.derived?.passive_perception ?? '?'), e.derivedPending || !e.derived),
         ],
       }),
-      ...pcNotes(e, nameW + 5),
+      ...pcNotes(e, nameW + 6),
     )
   }
   if (!v.rows.length) {
@@ -716,24 +773,14 @@ function partyTree(el: Els, v: PaneView): RenderElement {
   kids.push(el.Box({ flexDirection: 'row', marginTop: 1, children: [make({ key: 'reread', label: 're-read', hotkey: 'e', plain: true })] }))
   const readout = rereadText(v)
   if (readout) kids.push(text(el, readout, { color: TOKENS.faint, wrap: 'wrap' }))
-
-  // The entry line: the ui.input hook in register.ts applies what is typed. The
-  // phone's table has no Input (Elements['mobile']), but resolve hands it one
-  // that draws an empty Box, so the surface is asked too.
-  if ('Input' in el && v.surface !== 'mobile') {
-    const placeholder = 'm3 -9 · nux 16 · smoke mephit x6 hp 22 ac 12'
-    kids.push(el.Box({ marginTop: 1, children: [el.Input({ key: 'entry', label: 'entry', placeholder, value: v.typed, autoFocus: true, submitLabel: 'apply', onSubmit: NOOP })] }))
-    if (v.refused) kids.push(text(el, v.refused, { color: TOKENS.amber, wrap: 'wrap' }))
-    if (v.refused || !f) kids.push(...GRAMMAR.map((g) => text(el, g, { dimColor: true, wrap: 'wrap' })))
-  }
   done()
   return col(el, kids)
 }
 
-/** A monster's HP: a single one's `hp/max` and gauge, `0?` or `✕`; a group's members as a run, `22 13 0? ✕`. */
-function monsterHp(el: Base, surface: string, r: Row): RenderNode[] {
+/** A monster's HP: a single one's `hp/max` and gauge, `0?` or `✕`; a group's members as a run, `22 [13] 0? ✕` with the picked one bracketed. */
+function monsterHp(el: Base, surface: string, r: Row, picked: number | null): RenderNode[] {
   const one = (m: Member) => (m.dead ? '✕' : m.zero ? '0?' : String(m.hp))
-  if (r.members.length > 1) return [text(el, r.members.map(one).join(' '))]
+  if (r.members.length > 1) return [text(el, r.members.map((m, i) => (i === picked ? `[${one(m)}]` : one(m))).join(' '))]
   const m = r.members[0]!
   if (m.dead || m.zero) return [text(el, one(m), { bold: true })]
   return [text(el, `${m.hp}/${m.max}`, { bold: true }), gaugeNode(el, surface, bandSegments(m.hp, m.max), hpState(m.hp, m.max), `HP ${m.hp} of ${m.max}`)]
