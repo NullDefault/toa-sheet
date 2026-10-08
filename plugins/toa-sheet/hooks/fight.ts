@@ -5,8 +5,8 @@
 export type Side = 'pc' | 'monster'
 /** `working` is the signed changes in order (`22 − 9 = 13`); `zero` is `0?` pending, `dead` is confirmed by `x`. */
 export type Member = { hp: number; max: number; working: number[]; dead: boolean; zero: boolean }
-/** A row with no members has no HP tracked (a PC's is the sheet's); a single monster has one. `added` is its event index. */
-export type Row = { id: string; side: Side; name: string; init: number | null; ac: number | null; members: Member[]; out: boolean; down: boolean; added: number }
+/** A row with no members has no HP tracked (a PC's is the sheet's); a single monster has one. `added` is its event index; `downs` the rounds `k` put it down in. */
+export type Row = { id: string; side: Side; name: string; init: number | null; ac: number | null; members: Member[]; out: boolean; down: boolean; downs: number[]; added: number }
 /** An op as `describe` renders it; `working` is an HP op's result (`22 − 9 = 13`). */
 export type LogLine = { at: number; text: string; working?: string; reverted?: true }
 export type Fight = { id: string; startedAt: number; rows: Row[]; pointer: string | null; round: number; ended: number | null; log: LogLine[] }
@@ -102,18 +102,41 @@ export function describe(o: Op, f: Fight | null): string {
   return o.op === 'next' ? 'n' : 'end'
 }
 
+/**
+ * The fight as one Table-note line, for Ingest: what was tracked, in the DM's
+ * words (`out`, never "fled"). Null when no row was tracked. For example
+ * `fight: Smoke mephit ×6, 5 dead, 1 standing · Gout · Slaad out · 9 rounds · Gout down r2, r5`.
+ * Standing counts `0?` members too: only `x` confirms a death.
+ */
+export function summary(f: Fight): string | null {
+  const order = orderRows(f)
+  if (!order.length) return null
+  const rows = order.map((r) => {
+    const n = r.members.length
+    const dead = r.members.filter((m) => m.dead).length
+    const s = (n > 1 ? `${r.name} ×${n}` : r.name) + (dead ? `, ${dead} dead` : '') + (n - dead ? `, ${n - dead} standing` : '')
+    return r.out ? s + ' out' : s
+  })
+  const rounds = f.round ? [f.round === 1 ? '1 round' : `${f.round} rounds`] : []
+  const downs = order.filter((r) => r.downs.length).map((r) => `${r.name} down ${r.downs.map((d) => 'r' + d).join(', ')}`)
+  return 'fight: ' + [...rows, ...rounds, ...downs].join(' · ')
+}
+
 /** Apply one op to `f`, the event at index `i`: false when its row or member is not there. Returns the HP working an `hp` op produced. */
 function applyOp(f: Fight, o: Op, i: number, at: number): { working?: string } | false {
   const r = 'row' in o ? f.rows.find((x) => x.id === o.row) : undefined
   if (o.op === 'add') {
     const hp = o.hp
     const members = hp === null ? [] : Array.from({ length: Math.max(1, o.count) }, () => ({ hp, max: hp, working: [], dead: false, zero: false }))
-    f.rows.push({ id: 'm' + i, side: 'monster', name: o.name, init: o.init, ac: o.ac, members, out: false, down: false, added: i })
+    f.rows.push({ id: 'm' + i, side: 'monster', name: o.name, init: o.init, ac: o.ac, members, out: false, down: false, downs: [], added: i })
   } else if (o.op === 'init' || o.op === 'down') {
-    const row = r ?? { id: o.row, side: 'pc' as const, name: o.name, init: null, ac: null, members: [], out: false, down: false, added: i }
+    const row = r ?? { id: o.row, side: 'pc' as const, name: o.name, init: null, ac: null, members: [], out: false, down: false, downs: [], added: i }
     if (!r) f.rows.push(row)
     if (o.op === 'init') row.init = o.value
-    else row.down = o.value
+    else {
+      row.down = o.value
+      if (o.value) row.downs.push(f.round)
+    }
   } else if (o.op === 'next') {
     const n = nextRow(f)
     if (n) {

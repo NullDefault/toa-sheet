@@ -4,11 +4,11 @@
 // It watches the rules connector's own sheet_read / sheet_write results and the
 // vault's Table-log writes and session manifests, and draws what the servers
 // sent. It calls a tool itself only on a press: `e: re-read` on the party view,
-// or `n` when it starts a new round, to re-read; and the taps on the sheet view
-// (`d`, `h` and their number field, a slot's digit, `u`), each a `sheet_write`
-// at the pane's version. Each is `$.tool.call` with the press as `consent`,
-// checked for permission like the model's own calls (README, "Re-read and
-// permissions").
+// or `n` when it starts a new round, to re-read; `f: end` on the party view, to
+// log the fight; and the taps on the sheet view (`d`, `h` and their number
+// field, a slot's digit, `u`), each a `sheet_write` at the pane's version. Each
+// is `$.tool.call` with the press as `consent`, checked for permission like the
+// model's own calls (README, "Re-read and permissions").
 //
 // It also draws the connector's rows in the transcript as receipts (receipt.ts),
 // one line each, and flashes what a write changed in the pane.
@@ -20,7 +20,7 @@
 // lives in this file; sheet.ts, table.ts, look.ts, receipt.ts and view.ts are pure.
 
 import type { EngineInterface, MatchedHook, On, RenderElement, ToolCallArgs } from 'claude-code'
-import { fold, live, undoTarget, type Event, type Fight, type Op } from './fight.ts'
+import { fold, live, summary, undoTarget, type Event, type Fight, type Op } from './fight.ts'
 import { FLASH_MS } from './look.ts'
 import { CONNECTOR, VAULT, receipt } from './receipt.ts'
 import { asApplied, asCheck, asGet, entryAfterWrite, entryFromGet, matchEntry, payloadOf, type Entry } from './sheet.ts'
@@ -35,6 +35,7 @@ const SESSION = 'session'
 const FIGHT = 'party:fight' // the current fight's id; its ops are under FIGHT_LOG + id
 const FIGHT_LOG = 'party:log:' // one DM, one session: the last writer wins
 const VAULT_QUERY = 'mcp__vault__vault_query'
+const DRAFT_WRITE: string = 'mcp__vault__draft_write' // typed wide: the vault is no tool the declarations know
 /** The person's own words for the press that raises the mod's call; the engine strips it before any tool sees it. */
 const consent = (label: string, pane: string) => `The user pressed "${label}" on the ${pane} pane`
 
@@ -200,6 +201,31 @@ const say = ($: EngineInterface, text: string) => {
   $.ui.invalidate('ui.render')
 }
 
+/**
+ * The ended fight `f` (its fold before the end) as one Table note, through
+ * `draft_write`. Run after the end is applied and never awaited, so the press
+ * never waits on a permission dialog; a line not logged says why in the note.
+ */
+async function logFight($: EngineInterface, f: Fight) {
+  const not = (why: string) => say($, 'fight ended; not logged: ' + why)
+  const text = summary(f)
+  if (!text) return not('nothing tracked')
+  const s = session
+  if (!s) return not('no session (/party S04)')
+  let why: string
+  try {
+    if (!(await $.tool.list()).some((t) => t.name === DRAFT_WRITE)) return not('no vault connector')
+    // Top-level arguments, as draft_write takes them; the watcher sees the call and logs the line.
+    const r = await $.tool.call({ tool: DRAFT_WRITE, kind: 'table-note', session: s, text, consent: consent('f: end fight', 'Party') } as ToolCallArgs)
+    if (!('deny' in r) && !r.isError) return
+    why = firstLine('deny' in r ? r.deny : r.text)
+  } catch (err) {
+    why = firstLine(message(err))
+  }
+  $.ui.log('fight: draft_write refused: ' + why)
+  not(why)
+}
+
 /** A key on the party view: a digit picks a row, a letter acts on the picked one. */
 async function act($: EngineInterface, key: string) {
   ask = null
@@ -215,7 +241,11 @@ async function act($: EngineInterface, key: string) {
     $.ui.invalidate('ui.render')
     return adding ? focusOn($, 'add-name') : undefined
   }
-  if (key === 'act-f') return f ? apply($, { op: 'end' }) : undefined
+  if (key === 'act-f') {
+    if (!f) return
+    await apply($, { op: 'end' })
+    return void logFight($, f)
+  }
   if (key === 'act-s') {
     if (!sel) return say($, 'pick a row: 1–9')
     if (!sheets.has(sel.row)) return say($, 'no sheet')
