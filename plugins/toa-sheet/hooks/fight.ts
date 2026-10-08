@@ -10,9 +10,11 @@ export type Row = { id: string; side: Side; name: string; init: number | null; a
 /** An op as `describe` renders it; `working` is an HP op's result (`22 − 9 = 13`). */
 export type LogLine = { at: number; text: string; working?: string; reverted?: true }
 export type Fight = { id: string; startedAt: number; rows: Row[]; pointer: string | null; round: number; ended: number | null; log: LogLine[] }
-/** One press. `name` on `init`/`down` is the PC's roster name: its row is made on first mention. */
+export type AddOp = { op: 'add'; name: string; count: number; hp: number | null; ac: number | null; init: number | null }
+/** One press. `name` on `init`/`down` is the PC's roster name: its row is made on first mention. A `pack` is a combat pack's adds as one press. */
 export type Op =
-  | { op: 'add'; name: string; count: number; hp: number | null; ac: number | null; init: number | null }
+  | AddOp
+  | { op: 'pack'; name: string; rows: AddOp[] }
   | { op: 'init'; row: string; name: string; value: number }
   | { op: 'hp'; row: string; member: number; delta: number }
   | { op: 'kill'; row: string; member: number }
@@ -93,6 +95,7 @@ export function describe(o: Op, f: Fight | null): string {
     if (o.init !== null) parts.push(`init ${o.init}`)
     return parts.join(' · ')
   }
+  if (o.op === 'pack') return `pack ${o.name}: ${o.rows.length} group${o.rows.length === 1 ? '' : 's'}`
   if (o.op === 'init') return `${o.name} · init ${o.value}`
   if (o.op === 'hp') return `${named(f, o.row, o.member)} ${o.delta < 0 ? '−' : '+'}${Math.abs(o.delta)}`
   if (o.op === 'kill') return `${named(f, o.row, o.member)} ✕`
@@ -122,14 +125,20 @@ export function summary(f: Fight): string | null {
   return 'fight: ' + [...rows, ...rounds, ...downs].join(' · ')
 }
 
+/** An add's row, `id`, from the event at index `i`. */
+function addRow(f: Fight, o: AddOp, id: string, i: number) {
+  const hp = o.hp
+  const members = hp === null ? [] : Array.from({ length: Math.max(1, o.count) }, () => ({ hp, max: hp, working: [], dead: false, zero: false }))
+  f.rows.push({ id, side: 'monster', name: o.name, init: o.init, ac: o.ac, members, out: false, down: false, downs: [], added: i })
+}
+
 /** Apply one op to `f`, the event at index `i`: false when its row or member is not there. Returns the HP working an `hp` op produced. */
 function applyOp(f: Fight, o: Op, i: number, at: number): { working?: string } | false {
   const r = 'row' in o ? f.rows.find((x) => x.id === o.row) : undefined
-  if (o.op === 'add') {
-    const hp = o.hp
-    const members = hp === null ? [] : Array.from({ length: Math.max(1, o.count) }, () => ({ hp, max: hp, working: [], dead: false, zero: false }))
-    f.rows.push({ id: 'm' + i, side: 'monster', name: o.name, init: o.init, ac: o.ac, members, out: false, down: false, downs: [], added: i })
-  } else if (o.op === 'init' || o.op === 'down') {
+  if (o.op === 'add') addRow(f, o, 'm' + i, i)
+  // A pack's rows share its event index, so one undo takes them all; they order as listed.
+  else if (o.op === 'pack') o.rows.forEach((a, k) => addRow(f, a, `m${i}.${k}`, i))
+  else if (o.op === 'init' || o.op === 'down') {
     const row = r ?? { id: o.row, side: 'pc' as const, name: o.name, init: null, ac: null, members: [], out: false, down: false, downs: [], added: i }
     if (!r) f.rows.push(row)
     if (o.op === 'init') row.init = o.value
@@ -164,8 +173,8 @@ function applyOp(f: Fight, o: Op, i: number, at: number): { working?: string } |
   return {}
 }
 
-/** Does this op open a new fight when none is live? An add, or a PC's initiative. */
-const starts = (o: Op) => o.op === 'add' || o.op === 'init'
+/** Does this op open a new fight when none is live? An add, a pack, or a PC's initiative. */
+const starts = (o: Op) => o.op === 'add' || o.op === 'pack' || o.op === 'init'
 
 /**
  * Replay the events: undone ops are logged and skipped, an op that has nothing
@@ -185,4 +194,69 @@ export function fold(events: Event[]): Fight | null {
     f!.log.push({ at: e.at, text, ...result })
   })
   return f
+}
+
+export type Pack = { name: string; rows: AddOp[] }
+
+/**
+ * The combat packs in `Prep/Fights.md`: each `## ` heading a pack, each
+ * non-blank line under it a group, `<name> [xN|×N] [hp N] [ac N] [init N]`.
+ * Lines before the first heading are ignored. A pack with a line that does not
+ * read is refused whole; `errors` names the line, `Fights.md L7: …`.
+ */
+export function parsePacks(text: string): { packs: Pack[]; errors: string[] } {
+  const packs: Pack[] = []
+  const errors: string[] = []
+  let cur: { name: string; line: number; rows: AddOp[]; error: string | null } | null = null
+  const close = () => {
+    if (!cur) return
+    if (!cur.error && !cur.rows.length) cur.error = `Fights.md L${cur.line}: "${cur.name}" has no groups`
+    if (cur.error) errors.push(cur.error)
+    else packs.push({ name: cur.name, rows: cur.rows })
+  }
+  text.split(/\r?\n/).forEach((raw, n) => {
+    const line = raw.trim()
+    const heading = /^##(?:\s+(.*))?$/.exec(line)
+    if (heading) {
+      close()
+      cur = { name: (heading[1] ?? '').trim(), line: n + 1, rows: [], error: null }
+      if (!cur.name) cur.error = `Fights.md L${n + 1}: a pack needs a name`
+      return
+    }
+    if (!cur || !line || cur.error) return
+    const read = readGroup(line)
+    if (typeof read === 'string') cur.error = `Fights.md L${n + 1}: ${read}`
+    else cur.rows.push(read)
+  })
+  close()
+  return { packs, errors }
+}
+
+/** One group line as an add, or why it does not read. */
+function readGroup(line: string): AddOp | string {
+  const bad = `can't read "${line}"`
+  const words = line.replace(/^-\s+/, '').split(/\s+/)
+  const name: string[] = []
+  const got: { count?: number; hp?: number; ac?: number; init?: number } = {}
+  for (let k = 0; k < words.length; k++) {
+    const w = words[k]!
+    const times = /^[x×](\d+)$/i.exec(w)
+    const key = w.toLowerCase()
+    const field = key === 'hp' || key === 'ac' || key === 'init' ? key : null
+    if (!times && !field) {
+      if (Object.keys(got).length) return bad
+      name.push(w)
+      continue
+    }
+    const value = times ? times[1]! : words[++k]
+    if (value === undefined || !/^\d+$/.test(value)) return bad
+    const slot = times ? 'count' : field!
+    if (slot in got) return bad
+    got[slot] = Number(value)
+  }
+  const text = name.join(' ')
+  if (!text || got.count === 0) return bad
+  const count = got.count ?? 1
+  if (count > 1 && got.hp === undefined) return 'a group needs HP'
+  return { op: 'add', name: text.charAt(0).toUpperCase() + text.slice(1), count, hp: got.hp ?? null, ac: got.ac ?? null, init: got.init ?? null }
 }

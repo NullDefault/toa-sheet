@@ -22,7 +22,7 @@
 
 import type { ButtonProps, Elements, RenderElement, RenderNode, TextProps } from 'claude-code'
 import { actionGroups, type ActionRow } from './actions.ts'
-import { live, orderRows, statusText, type Fight, type Member, type Row } from './fight.ts'
+import { live, orderRows, statusText, type Fight, type Member, type Pack, type Row } from './fight.ts'
 import { describeChange, type Entry } from './sheet.ts'
 import { bandSegments, gaugeRuns, hpSegments, hpState, pipRuns, RECEIPT_INDENT, rule, TOKENS, type Run, type Segment, type Tone } from './look.ts'
 import { cellsSvg, hpSvg, pipsSvg, type Art } from './pixel.ts'
@@ -96,6 +96,8 @@ export interface PaneView {
   adding: Adding | null
   /** Why the last key did nothing, until an op applies. */
   note: string | null
+  /** The pack list `c` opened, or null. While it is open the digits load a pack, not pick a row. */
+  packs: Pack[] | null
   /** The sheet view's open number field, for a tap. */
   tap: Tap | null
 }
@@ -104,9 +106,10 @@ export interface PaneView {
 const FIGHT_KEYS = [
   ['next', 'n', 'next'], ['undo', 'u', 'undo'], ['act-d', 'd', 'dmg'], ['act-h', 'h', 'heal'], ['act-i', 'i', 'init'],
   ['act-x', 'x', 'kill'], ['act-o', 'o', 'out'], ['act-k', 'k', 'down'], ['act-t', 't', 'turn'], ['act-f', 'f', 'end'], ['act-a', 'a', 'add'],
+  ['act-c', 'c', 'packs'],
 ] as const
-/** With no fight: `a add · i init`, and `u undo` while the last fight's end can be undone. */
-const IDLE_KEYS = [FIGHT_KEYS[10], FIGHT_KEYS[4]]
+/** With no fight: `a add · c packs · i init`, and `u undo` while the last fight's end can be undone. */
+const IDLE_KEYS = [FIGHT_KEYS[10], FIGHT_KEYS[11], FIGHT_KEYS[4]]
 const ENDED_KEYS = [...IDLE_KEYS, FIGHT_KEYS[1]]
 const ADD_FIELDS = [
   ['name', ''], ['count', '1'], ['hp', 'blank: no HP tracked'], ['ac', ''], ['init', ''],
@@ -671,6 +674,13 @@ function partyTree(el: Els, v: PaneView): RenderElement {
   const keys = [...(f ? FIGHT_KEYS : v.fight?.ended ? ENDED_KEYS : IDLE_KEYS), ...(picked ? [['act-s', 's', 'sheet'] as const] : [])]
   kids.push(wrapRow(el, keys.map(([key, hotkey, label]) => make({ key, label, hotkey, plain: true }))))
   if (v.note) kids.push(text(el, v.note, { color: TOKENS.amber, wrap: 'wrap' }))
+  if (v.packs) {
+    kids.push(ruleLine(el, 'Packs', v.columns))
+    v.packs.slice(0, 9).forEach((p, k) => {
+      const label = `${p.name} · ${p.rows.length} group${p.rows.length === 1 ? '' : 's'}`
+      kids.push(make({ key: 'pack-' + (k + 1), label, hotkey: String(k + 1), plain: true }))
+    })
+  }
   // The number field and the add form: the ui.input hook in register.ts takes
   // what is entered. The phone's table has no Input (Elements['mobile']), but
   // resolve hands it one that draws an empty Box, so the surface is asked too.
@@ -707,7 +717,7 @@ function partyTree(el: Els, v: PaneView): RenderElement {
     const on = v.sel?.row === id
     const name = (on ? '▸' : '') + label.slice(0, w)
     const pad = w + 1 - name.length
-    const props = { key: 'row-' + id, label: name, ...(digit <= 9 ? { hotkey: String(digit) } : {}), plain: true as const, ...(on ? { variant: 'primary' as const } : {}) }
+    const props = { key: 'row-' + id, label: name, ...(digit <= 9 && !v.packs ? { hotkey: String(digit) } : {}), plain: true as const, ...(on ? { variant: 'primary' as const } : {}) }
     return row(el, [make(props), ...(pad > 0 ? [text(el, ' '.repeat(pad))] : [])], 0)
   }
   /** A PC's HP and gauge, from the sheet; hollow when stale. */

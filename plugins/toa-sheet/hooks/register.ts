@@ -16,11 +16,13 @@
 // The party view's keys are the DM's fight (fight.ts): a digit picks a row, a
 // letter acts on it, and each applied op is stored; the fight drawn is their fold.
 //
-// Mods API calls: $.ui, $.store, $.command, $.clock, $.tool only. Every call
+// `c: packs` reads the DM's combat packs from Prep/Fights.md, the one file it reads.
+//
+// Mods API calls: $.ui, $.store, $.command, $.clock, $.tool, $.fs.read only. Every call
 // lives in this file; sheet.ts, table.ts, look.ts, receipt.ts and view.ts are pure.
 
 import type { EngineInterface, MatchedHook, On, RenderElement, ToolCallArgs } from 'claude-code'
-import { fold, live, summary, undoTarget, type Event, type Fight, type Op } from './fight.ts'
+import { fold, live, parsePacks, summary, undoTarget, type Event, type Fight, type Op, type Pack } from './fight.ts'
 import { FLASH_MS } from './look.ts'
 import { CONNECTOR, VAULT, receipt } from './receipt.ts'
 import { asApplied, asCheck, asGet, entryAfterWrite, entryFromGet, matchEntry, payloadOf, type Entry } from './sheet.ts'
@@ -35,6 +37,7 @@ const SESSION = 'session'
 const FIGHT = 'party:fight' // the current fight's id; its ops are under FIGHT_LOG + id
 const FIGHT_LOG = 'party:log:' // one DM, one session: the last writer wins
 const VAULT_QUERY = 'mcp__vault__vault_query'
+const FIGHTS = 'Prep/Fights.md' // the DM's combat packs, relative to the session's folder (the vault)
 const DRAFT_WRITE: string = 'mcp__vault__draft_write' // typed wide: the vault is no tool the declarations know
 /** The person's own words for the press that raises the mod's call; the engine strips it before any tool sees it. */
 const consent = (label: string, pane: string) => `The user pressed "${label}" on the ${pane} pane`
@@ -67,6 +70,7 @@ let ask: Ask | null = null
 let adding: Adding | null = null
 // The note line under the view on show; a view switch clears it.
 let note: string | null = null
+let packs: Pack[] | null = null // the pack list `c` opened, read fresh each time
 // The sheet view's taps, never stored: the open number field, and the last tap
 // written on this machine (the version it wrote over, `from`, and the one it wrote, `to`), for `u`.
 let tap: Tap | null = null
@@ -107,6 +111,7 @@ function storedOp(o: any): boolean {
   if (!o || typeof o !== 'object') return false
   switch (o.op) {
     case 'add': return str(o.name) && int(o.count) && intOrNull(o.hp) && intOrNull(o.ac) && intOrNull(o.init)
+    case 'pack': return str(o.name) && Array.isArray(o.rows) && o.rows.every((r: any) => r?.op === 'add' && storedOp(r))
     case 'init': return str(o.row) && str(o.name) && int(o.value)
     case 'hp': return str(o.row) && int(o.member) && int(o.delta)
     case 'kill': return str(o.row) && int(o.member)
@@ -248,6 +253,13 @@ async function act($: EngineInterface, key: string) {
     sel = sel?.row === id && row && row.members.length > 1 ? { row: id, member: (sel.member + 1) % row.members.length } : { row: id, member: 0 }
     return $.ui.invalidate('ui.render')
   }
+  if (key === 'act-c') return openPacks($)
+  if (key.startsWith('pack-')) {
+    const p = packs?.[Number(key.slice(5)) - 1]
+    if (!p) return
+    packs = null
+    return apply($, { op: 'pack', name: p.name, rows: p.rows })
+  }
   if (key === 'act-a') {
     adding = adding ? null : { name: '', count: '', hp: '', ac: '', init: '' }
     $.ui.invalidate('ui.render')
@@ -286,6 +298,25 @@ async function act($: EngineInterface, key: string) {
   if (key === 'act-o') return row ? apply($, { op: 'out', row: id }) : say($, 'not in the fight')
   if (key === 'act-k') return apply($, { op: 'down', row: id, name: nameOf(id), value: !row?.down })
   if (key === 'act-t') return row ? turn($, { op: 'point', row: id }, 't: turn') : say($, 'not in the fight')
+}
+
+/** `c`: the packs in Prep/Fights.md, read fresh, as a list a digit loads from; `c` again closes it. */
+async function openPacks($: EngineInterface) {
+  if (packs) {
+    packs = null
+    return $.ui.invalidate('ui.render')
+  }
+  let text: string
+  try {
+    text = await $.fs.read(FIGHTS)
+  } catch {
+    return say($, 'no ' + FIGHTS)
+  }
+  const read = parsePacks(text)
+  packs = read.packs.length ? read.packs : null
+  // A pack that does not read is left out of the list; the note names its line.
+  note = read.errors[0] ?? (packs ? null : 'no packs in ' + FIGHTS)
+  $.ui.invalidate('ui.render')
 }
 
 const ADD_FIELDS = ['name', 'count', 'hp', 'ac', 'init'] as const
@@ -671,6 +702,7 @@ export function register(on: On) {
       ask: ask && { ...ask, name: nameOf(ask.row) },
       adding,
       note,
+      packs,
       tap,
     })
   })
@@ -699,9 +731,10 @@ export function register(on: On) {
 
   // The pane's presses: a tab, the DM-rules badge (which opens Notes), the party
   // button, the sheet's taps, the fight's keys (a row, an action, next, undo), the re-read. The
-  // Buttons' own closures do nothing, so a kept Button never acts on stale state. `e`, `n` and `t`
-  // take their press rather than pass it to core: a sweep may outlive its Button's drawing (`s`
-  // mid-sweep shows a sheet without them), and core's look-up of a retired handle throws.
+  // Buttons' own closures do nothing, so a kept Button never acts on stale state. `e`, `n`, `t`
+  // and a pack's digit take their press rather than pass it to core: a sweep may outlive its
+  // Button's drawing (`s` mid-sweep shows a sheet without them), a pack's load retires its own
+  // Button, and core's look-up of a retired handle throws.
   // Other presses still pass: `f`'s unawaited log write must start while the press is in flight.
   on('ui.press', { plugin: 'toa-sheet' }, async ($, e, next) => {
     const id = String(e.element)
@@ -710,7 +743,7 @@ export function register(on: On) {
       note = null
       $.ui.invalidate('ui.render')
       await $.ui.open({ id: PANE, title: 'Party', columns: 60 })
-    } else if (id === 'act-t') {
+    } else if (id === 'act-t' || id.startsWith('pack-')) {
       await act($, id)
       return { element: id }
     } else if (id.startsWith('row-') || id.startsWith('act-')) {
