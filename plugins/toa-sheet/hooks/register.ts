@@ -4,7 +4,7 @@
 // It watches the rules connector's own sheet_read / sheet_write results and the
 // vault's Table-log writes and session manifests, and draws what the servers
 // sent. It calls a tool itself only on a press: `e: re-read` on the party view,
-// or `n` when it starts a new round, to re-read; `f: end` on the party view, to
+// or `n` or `t` when it starts a new round, to re-read; `f: end` on the party view, to
 // log the fight; and the taps on the sheet view (`d`, `h` and their number
 // field, a slot's digit, `u`), each a `sheet_write` at the pane's version. Each
 // is `$.tool.call` with the press as `consent`, checked for permission like the
@@ -195,6 +195,17 @@ async function apply($: EngineInterface, op: Op | 'undo') {
   await park($)
 }
 
+/**
+ * `n` or `t`: apply the op, and when it starts a new round re-read the sheets, so HP the
+ * players wrote shows. Awaited, as `e`'s is: the mod's own watcher sees only the calls made
+ * while the press is in flight.
+ */
+async function turn($: EngineInterface, op: Op, label: string) {
+  const was = fight()?.round ?? 0
+  await apply($, op)
+  if ((fight()?.round ?? 0) > was) await refresh($, consent(label, 'Party') + ', which starts a new round and re-reads')
+}
+
 /** The note line under the party's order or the sheet's taps. */
 const say = ($: EngineInterface, text: string) => {
   note = text
@@ -272,7 +283,7 @@ async function act($: EngineInterface, key: string) {
   if (key === 'act-x') return tracked ? apply($, { op: 'kill', row: id, member }) : say($, 'no HP tracked here')
   if (key === 'act-o') return row ? apply($, { op: 'out', row: id }) : say($, 'not in the fight')
   if (key === 'act-k') return apply($, { op: 'down', row: id, name: nameOf(id), value: !row?.down })
-  if (key === 'act-t') return row ? apply($, { op: 'point', row: id }) : say($, 'not in the fight')
+  if (key === 'act-t') return row ? turn($, { op: 'point', row: id }, 't: turn') : say($, 'not in the fight')
 }
 
 const ADD_FIELDS = ['name', 'count', 'hp', 'ac', 'init'] as const
@@ -493,7 +504,7 @@ async function watchVault($: EngineInterface, e: any, result: unknown) {
 }
 
 /**
- * The re-read, on `e` and on `n` into a new round, one sweep at a time: the
+ * The re-read, on `e` and on `n` or `t` into a new round, one sweep at a time: the
  * connector's `list`, then a `get` per id, one at a time (a dialog each in
  * default mode, never several at once), then the session's manifest. The
  * watchers cache the answers; this reads only whether each call answered.
@@ -606,7 +617,7 @@ export function register(on: On) {
     return {}
   })
 
-  // `/party [S04]`: the party view, drawn from the cache. It calls no tool: only `e`, or `n` into a new round, re-reads.
+  // `/party [S04]`: the party view, drawn from the cache. It calls no tool: only `e`, or `n` or `t` into a new round, re-reads.
   on('command.run', { command: 'party' }, async ($, e) => {
     const arg = String(e.args ?? '').trim().toUpperCase()
     if (isSessionId(arg)) {
@@ -696,11 +707,7 @@ export function register(on: On) {
     } else if (id.startsWith('tap-') || id.startsWith('slot-')) {
       await tapKey($, id)
     } else if (id === 'next' && live(fight())) {
-      const was = fight()!.round
-      await apply($, { op: 'next' })
-      // A new round re-reads the sheets, so HP the players wrote shows. Awaited, as `e`'s is: the mod's own
-      // watcher sees only the calls made while the press is in flight.
-      if ((fight()?.round ?? 0) > was) await refresh($, consent('n: next', 'Party') + ', which starts a new round and re-reads')
+      await turn($, { op: 'next' }, 'n: next')
     } else if (id === 'undo') {
       // Also after `f`: undoing the end brings the fight back.
       await apply($, 'undo')

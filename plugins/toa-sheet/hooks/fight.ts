@@ -146,8 +146,11 @@ function applyOp(f: Fight, o: Op, i: number, at: number): { working?: string } |
   } else if (o.op === 'end') f.ended = at
   else if (!r) return false
   else if (o.op === 'out') r.out = true
-  else if (o.op === 'point') f.pointer = r.id
-  else {
+  else if (o.op === 'point') {
+    // The round stays, except that a fight's first `t` starts round 1, as its first `n` does.
+    f.pointer = r.id
+    f.round = Math.max(f.round, 1)
+  } else {
     const m = r.members[o.member]
     if (!m) return false
     if (o.op === 'kill') Object.assign(m, { dead: true, zero: false })
