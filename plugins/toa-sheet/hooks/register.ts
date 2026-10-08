@@ -61,10 +61,11 @@ let rereading = false
 let fightEvents: Event[] = [] // the current fight's ops and undos, as stored
 let fightId: string | null = null
 // The DM's hand on the party view, never stored: the picked row, the open number
-// field or add form, and the amber note (why the last key did nothing).
+// field or add form.
 let sel: { row: string; member: number } | null = null
 let ask: Ask | null = null
 let adding: Adding | null = null
+// The note line under the view on show; a view switch clears it.
 let note: string | null = null
 // The sheet view's taps, never stored: the open number field, and the last tap
 // written on this machine (the version it wrote over, `from`, and the one it wrote, `to`), for `u`.
@@ -262,6 +263,7 @@ async function act($: EngineInterface, key: string) {
     if (!sheets.has(sel.row)) return say($, 'no sheet')
     focus = sel.row
     view = 'sheet'
+    note = null
     $.ui.invalidate('ui.render')
     return void (await $.ui.open({ id: PANE, title: focused()!.name }))
   }
@@ -610,6 +612,7 @@ export function register(on: On) {
       focus = hit.id
     }
     view = 'sheet'
+    note = null
     dismissed = false
     await $.ui.open({ id: PANE, title: focused()?.name ?? 'Sheet', focus: true, closeOnEscape: true })
     paneOpen = true
@@ -625,6 +628,7 @@ export function register(on: On) {
       await $.store.set(SESSION, session)
     }
     view = 'party'
+    note = null
     dismissed = false
     await $.ui.open({ id: PANE, title: 'Party', focus: true, columns: 60 })
     paneOpen = true
@@ -695,24 +699,33 @@ export function register(on: On) {
 
   // The pane's presses: a tab, the DM-rules badge (which opens Notes), the party
   // button, the sheet's taps, the fight's keys (a row, an action, next, undo), the re-read. The
-  // Buttons' own closures do nothing, so a kept Button never acts on stale state.
+  // Buttons' own closures do nothing, so a kept Button never acts on stale state. `e`, `n` and `t`
+  // take their press rather than pass it to core: a sweep may outlive its Button's drawing (`s`
+  // mid-sweep shows a sheet without them), and core's look-up of a retired handle throws.
+  // Other presses still pass: `f`'s unawaited log write must start while the press is in flight.
   on('ui.press', { plugin: 'toa-sheet' }, async ($, e, next) => {
     const id = String(e.element)
     if (id === 'view-party') {
       view = 'party'
+      note = null
       $.ui.invalidate('ui.render')
       await $.ui.open({ id: PANE, title: 'Party', columns: 60 })
+    } else if (id === 'act-t') {
+      await act($, id)
+      return { element: id }
     } else if (id.startsWith('row-') || id.startsWith('act-')) {
       await act($, id)
     } else if (id.startsWith('tap-') || id.startsWith('slot-')) {
       await tapKey($, id)
     } else if (id === 'next' && live(fight())) {
       await turn($, { op: 'next' }, 'n: next')
+      return { element: id }
     } else if (id === 'undo') {
       // Also after `f`: undoing the end brings the fight back.
       await apply($, 'undo')
     } else if (id === 'reread') {
       await refresh($, consent('e: re-read', 'Party'))
+      return { element: id }
     }
     const hit = TABS.find((t) => tabKey(t.id) === e.element)?.id ?? (e.element === RULES_KEY ? 'notes' : null)
     if (hit && hit !== tab) {
