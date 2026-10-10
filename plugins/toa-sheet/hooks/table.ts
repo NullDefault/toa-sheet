@@ -66,7 +66,3 @@ export const isSessionId = (s: string) => /^S\d\d$/.test(s)
 
 /** The party's rows, by name. (The DM's own roster order arrives with `party:roster`, handoff 18 step A.) */
 export const rosterRows = (entries: Entry[]): Entry[] => [...entries].sort((a, b) => a.name.localeCompare(b.name))
-
-/** Handoff 18's freshness rule, on when this mod last confirmed the sheet (it cannot know writes it did not see). */
-export const STALE_MS = 15 * 60_000
-export const stale = (readAt: number, now: number) => now - readAt > STALE_MS

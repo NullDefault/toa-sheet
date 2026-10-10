@@ -38,6 +38,8 @@ export interface Entry {
   derivedPending: boolean
   /** Loaded from the store, written by an earlier session. */
   fromStore: boolean
+  /** A write's diff disagreed with this copy (`applyDiff`'s `matched: false`): it missed a version. A get clears it. */
+  drift: boolean
   last: Change | null
   /** The last `sheet_read check` of this sheet, counts only (the findings stay in the transcript). */
   check?: { at: number; version: number; warnings: number; infos: number }
@@ -101,10 +103,16 @@ export interface GetPayload {
   unresolved: string[]
 }
 
-/** A `sheet_read get` answer, or null when the payload is anything else. */
+/**
+ * A `sheet_read get` answer of the head, or null when the payload is anything
+ * else. A get of an old version (`character.showing_version` set) is null too:
+ * its sheet is the old one but `character.version` is the head, so caching it
+ * would draw history as current, confirmed by every list after.
+ */
 export function asGet(d: unknown): GetPayload | null {
   if (!isObj(d) || !isObj(d.character) || !isObj(d.sheet)) return null
   const c = d.character
+  if (c.showing_version !== undefined) return null
   if (typeof c.id !== 'string' || !Number.isInteger(c.version) || c.version < 1) return null
   if (d.sheet.schema !== 1 || typeof d.sheet.name !== 'string') return null
   if (d.derived !== null && !isObj(d.derived)) return null
@@ -112,18 +120,33 @@ export function asGet(d: unknown): GetPayload | null {
   return { character: c as GetPayload['character'], sheet: d.sheet, derived: d.derived ?? null, unresolved }
 }
 
+/** A Constitution save the server raised for damage to a concentrating sheet (patch 19): drawn as sent, never computed here. */
+export interface Save {
+  spell: string
+  dc: number
+  bonus: number
+  damage?: number
+}
+
 export interface AppliedPayload {
   character: string
   name?: string
   version: number
   diff: DiffItem[]
+  save?: Save
+}
+
+function asSave(v: unknown): Save | undefined {
+  if (!isObj(v) || typeof v.spell !== 'string' || !Number.isInteger(v.dc) || !Number.isInteger(v.bonus)) return undefined
+  return { spell: v.spell, dc: v.dc, bonus: v.bonus, ...(Number.isInteger(v.damage) ? { damage: v.damage } : {}) }
 }
 
 /** A `sheet_write apply=true` answer that wrote a version, or null. */
 export function asApplied(d: unknown): AppliedPayload | null {
   if (!isObj(d) || d.applied !== true || typeof d.character !== 'string' || !Number.isInteger(d.version)) return null
   if (!Array.isArray(d.diff) || !d.diff.every((x: unknown) => isObj(x) && typeof x.path === 'string' && x.path.startsWith('/'))) return null
-  return { character: d.character, name: typeof d.name === 'string' ? d.name : undefined, version: d.version, diff: d.diff }
+  const save = asSave(d.concentration_save)
+  return { character: d.character, name: typeof d.name === 'string' ? d.name : undefined, version: d.version, diff: d.diff, ...(save ? { save } : {}) }
 }
 
 export interface Finding {
@@ -160,6 +183,7 @@ export function entryFromGet(g: GetPayload, server: string, now: number, check?:
     refreshing: false,
     derivedPending: false,
     fromStore: false,
+    drift: false,
     last: null,
     ...(check ? { check } : {}),
   }
@@ -173,13 +197,14 @@ const OUTSIDE_DERIVED = [
   /^\/speed(\/|$)/,
   /^\/spellcasting\/(slots_used|pact_slots_used)(\/|$)/,
   /^\/resources(\/|$)/,
-  /^\/inventory(\/|$)/,
   /^\/currency(\/|$)/,
   /^\/conditions(\/|$)/,
+  /^\/concentration(\/|$)/,
   /^\/exhaustion$/,
   /^\/house_rules(\/|$)/,
   /^\/notes$/,
   /^\/details(\/|$)/,
+  /^\/requests(\/|$)/,
 ]
 
 export const touchesDerived = (path: string) => !OUTSIDE_DERIVED.some((re) => re.test(path))
@@ -221,10 +246,11 @@ export function applyDiff(sheet: Record<string, any>, diff: DiffItem[]): { sheet
 
 /** The cached entry after a write: diff applied, waiting for a get. */
 export function entryAfterWrite(entry: Entry, w: AppliedPayload, reason: string, now: number): Entry {
-  const { sheet } = applyDiff(entry.sheet, w.diff)
+  const { sheet, matched } = applyDiff(entry.sheet, w.diff)
   return {
     ...entry,
     sheet,
+    drift: entry.drift || !matched,
     name: typeof sheet.name === 'string' ? sheet.name : entry.name,
     version: w.version,
     seenAt: now,
@@ -262,4 +288,52 @@ export function describeChange(c: Change, sheet: Record<string, any>): string {
   const parts = c.diff.slice(0, 3).map((d) => pathLabel(d.path, sheet) + (d.from === undefined ? '' : ' ' + v(d.from)) + ' → ' + v(d.to))
   if (c.diff.length > 3) parts.push('+' + (c.diff.length - 3) + ' more')
   return parts.join(', ') + (c.reason ? ' · ' + c.reason : '')
+}
+
+/**
+ * What a `sheet_read list` means for the cache: `fetch` the ids whose version
+ * moved or that were never got, `confirm` the ids it already holds at that
+ * version. A copy known wrong (`drift`) or missing its `derived` is fetched
+ * even at the same version. An id cached but not listed is left alone: a
+ * player's list holds only their own sheet.
+ */
+export function moved(entries: Entry[], listed: { id: string; version: number }[]): { fetch: string[]; confirm: string[] } {
+  const byId = new Map(entries.map((e) => [e.id, e]))
+  const fetch: string[] = []
+  const confirm: string[] = []
+  for (const { id, version } of listed) {
+    const e = byId.get(id)
+    if (!e || e.version !== version || e.drift || e.derivedPending) fetch.push(id)
+    else confirm.push(id)
+  }
+  return { fetch, confirm }
+}
+
+export type Coin = 'cp' | 'sp' | 'ep' | 'gp' | 'pp'
+
+/** `+50`, `-12`, `+5 sp`, `-3PP`: a signed amount of one coin, gp when unnamed. Unsigned is refused: a guessed direction moves money silently. */
+export function parseCoins(text: string): { coin: Coin; delta: number } | { refused: string } {
+  const t = text.trim()
+  const m = /^([+-])\s*(\d+)\s*(cp|sp|ep|gp|pp)?$/i.exec(t)
+  if (!m) return { refused: /^\d+\s*(cp|sp|ep|gp|pp)?$/i.test(t) ? '+ or −?' : 'an amount like +50 or -5 sp' }
+  const n = Number(m[2])
+  return { coin: (m[3]?.toLowerCase() ?? 'gp') as Coin, delta: m[1] === '-' ? -n : n }
+}
+
+/** A coin's amount on a sheet, 0 when the sheet has none. */
+export const coinsOf = (sheet: Record<string, any>, coin: Coin): number => {
+  const n = sheet.currency?.[coin]
+  return typeof n === 'number' ? n : 0
+}
+
+/**
+ * One coin moved by `delta`, as a JSON Patch compare-and-set on the cached
+ * amount: the server refuses it if anyone moved that coin since. Never makes
+ * change between coins; below zero is refused.
+ */
+export function coinChange(sheet: Record<string, any>, name: string, coin: Coin, delta: number): { changes: Record<string, unknown>[] } | { refused: string } {
+  const old = coinsOf(sheet, coin)
+  if (old + delta < 0) return { refused: `${name} has ${old} ${coin}` }
+  const path = '/currency/' + coin
+  return { changes: [{ op: 'test', path, value: old }, { op: 'replace', path, value: old + delta }] }
 }

@@ -21,6 +21,7 @@ export const TOKENS = {
   amber: '#f0a020',
   alert: '#ff3b30',
   cyan: '#3fc8e0',
+  violet: '#a07cff',
   faint: '#6a6a6a',
 } as const
 
@@ -39,14 +40,14 @@ export const RECEIPT_INDENT = 2
  */
 export const FLASH_MS = 800
 
-/** One glyph pair for every gauge. `▮`/`▯` wait for a live check of the players' fonts. */
-export const GAUGE = { full: '█', spent: '░' } as const
+/** One glyph pair for every gauge, and `none` for a number never written (never the spent glyph). `▮`/`▯` wait for a live check of the players' fonts. */
+export const GAUGE = { full: '█', spent: '░', none: '·' } as const
 
 /** HP's state: phosphor above half, amber to a quarter, alert below. */
 export type HpState = 'phosphor' | 'amber' | 'alert'
 /** A gauge's full-glyph colour: an HP state, or ink for slots and resources. */
 export type Tone = HpState | 'ink'
-export type Segment = 'full' | 'spent' | 'temp'
+export type Segment = 'full' | 'spent' | 'temp' | 'none'
 
 export function hpState(current: number, max: number): HpState {
   const frac = max > 0 ? current / max : 0
@@ -76,6 +77,9 @@ export function bandSegments(current: number, max: number, cells = 10): Segment[
   return segments(Math.max(0, Math.min(cells, Math.round(frac * cells))), cells)
 }
 
+/** A gauge for a number the sheet has never held: `cells` empty, faint segments. */
+export const noneSegments = (cells = 10): Segment[] => Array(cells).fill('none')
+
 /** One run of a gauge: the glyphs and the props of the `Text` that draws them. */
 export interface Run {
   text: string
@@ -86,7 +90,7 @@ const toneProps = (tone: Tone): TextProps => (tone === 'ink' ? {} : { color: TOK
 
 /**
  * The `Text` runs for one gauge: full glyphs in the tone's colour, spent ones
- * dim, temp as cyan full glyphs; empty runs dropped. `spaced` puts a space
+ * dim, temp as cyan full glyphs, none as faint dots; empty runs dropped. `spaced` puts a space
  * between glyphs (slot and resource pips).
  */
 export function gaugeRuns(segments: Segment[], tone: Tone, opts: { spaced?: boolean } = {}): Run[] {
@@ -95,12 +99,13 @@ export function gaugeRuns(segments: Segment[], tone: Tone, opts: { spaced?: bool
   const add = (seg: Segment, props: TextProps) => {
     const n = segments.filter((s) => s === seg).length
     if (!n) return
-    const glyph = seg === 'spent' ? GAUGE.spent : GAUGE.full
+    const glyph = seg === 'spent' ? GAUGE.spent : seg === 'none' ? GAUGE.none : GAUGE.full
     runs.push({ text: (runs.length ? sep : '') + Array(n).fill(glyph).join(sep), props })
   }
   add('full', toneProps(tone))
   add('spent', { dimColor: true })
   add('temp', { color: TOKENS.cyan })
+  add('none', { color: TOKENS.faint })
   return runs
 }
 

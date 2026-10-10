@@ -4,8 +4,8 @@
 // API. Nothing here computes a rule:
 // - the facts are the snapshot's, copied by facts/build.py;
 // - the attack bonus and save DC are the sheet's `derived` numbers for the
-//   class the spell is listed under, and a weapon's bonus is the sheet's own
-//   written one;
+//   class the spell is listed under, and a weapon's to-hit is the server's
+//   `derived.weapons` row for it;
 // - a cantrip's die is a lookup in the data's own scaling table at
 //   `derived.total_level`.
 // A name with no record is shown as the sheet writes it and flagged, never guessed.
@@ -28,14 +28,14 @@ export interface ActionRow {
   /**
    * What the turn needs first, at full strength: a casting time that is not an
    * action (a bonus action or reaction is another part of the turn), then what
-   * to roll with the sheet's number: `ATK +5`, `CON save DC 11`, `ATK +2 (as written)`.
+   * to roll with the sheet's number: `ATK +5`, `CON save DC 11`.
    */
   lead: string
-  /** The rest, dim: the level when no heading says it, range, a duration that is not instant; or a weapon's properties. */
+  /** The rest, dim: the level when no heading says it, range, a duration that is not instant; for a weapon, `not proficient`, `sheet says +4`, its mastery. */
   facts: string[]
   badges: ('conc' | 'ritual')[]
-  /** The rest of the sheet's own line for a weapon, after its bonus ("1d8 bludgeoning"), shown as written. */
-  written: string
+  /** A weapon's damage the sheet does not write: the data's dice, marked with an amber `?`. */
+  guess: boolean
   /** No record in the snapshot: shown plainly and flagged. */
   missing: boolean
   /** The book the record came from (`XPHB`). */
@@ -138,7 +138,7 @@ interface Caster {
 /** One spell row: the facts as a 2024 player reads them, the roll with the class's own number. */
 export function spellRow(key: string, name: string, source: string | undefined, e: Entry, opts: { cls: string; caster: Caster | null; dm: boolean; always: boolean; otherLevel?: boolean }): ActionRow {
   const hit = spellFact(name, source, e.sheet.ruleset)
-  const base = { key, name, cls: opts.cls, dm: opts.dm, always: opts.always, written: '', badges: [] as ActionRow['badges'] }
+  const base = { key, name, cls: opts.cls, dm: opts.dm, always: opts.always, guess: false, badges: [] as ActionRow['badges'] }
   if (!hit) return { ...base, effect: '', lead: '', facts: ['Not in the rules snapshot'], missing: true, source: source ?? '' }
   const [level, , time, range, , duration, flagText, damage, save, diceText] = hit.row
   const flags = flagText ? flagText.split(' ') : []
@@ -165,61 +165,65 @@ export function spellRow(key: string, name: string, source: string | undefined, 
 }
 
 /**
- * A weapon line as a player reads it: "+2 · 1d8 bludgeoning". The transcription
- * writes "attack written +2, 1d8 bludgeoning; …"; only that prefix is taken off,
- * the rest follows after a ·. Anything else is shown as written. No bonus is computed.
- */
-export function weaponLine(note: string): string {
-  const m = /^attack written ([+-]\d+), (.+)$/.exec(note.trim())
-  return m ? [m[1], ...(m[2] ?? '').split('; ')].join(' · ') : note
-}
-
-/**
  * Weapon Mastery (a 2024 class feature). Its `choice`, when written, names the
  * weapons it covers ("Longsword, Handaxe"); without one, every weapon's
  * mastery property is shown.
  */
-function mastery(e: Entry): { all: boolean; names: string[] } | null {
+export function mastery(e: Entry): { all: boolean; names: string[] } | null {
   const f = [...(e.sheet.features ?? []), ...(e.sheet.feats ?? [])].find((x: any) => norm(String(x.name ?? '')) === 'weapon mastery')
   if (!f) return null
   const names = typeof f.choice === 'string' ? f.choice.split(/,|;|\band\b/).map(norm).filter(Boolean) : []
   return { all: !names.length, names }
 }
 const singular = (n: string) => (n.endsWith('s') ? n.slice(0, -1) : n)
+export const sameWeapon = (a: string, b: string) => singular(norm(a)) === singular(norm(b))
 
-/** The weapon's data line: `Melee · Versatile 1d8 · Topple`, mastery only with Weapon Mastery. */
-export function weaponFacts(row: WeaponRow, withMastery: boolean): string[] {
-  const [, kind, , , versatile, props, range, masteryName] = row
-  const words = (props ? props.split(',') : []).map((p) =>
-    p === 'Versatile' && versatile ? `Versatile ${versatile}` : (p === 'Thrown' || p === 'Ammunition') && range ? `${p} ${range}` : p,
-  )
-  return [kind === 'ranged' ? 'Ranged' : 'Melee', ...words, ...(withMastery && masteryName ? [masteryName] : [])]
+/** The damage a weapon's note writes first ("1d8 bludgeoning; …" → "1d8 bludgeoning"), or ''. */
+export function writtenDamage(note: string): string {
+  const first = (note.split(';')[0] ?? '').trim()
+  return /^\d*d\d+/i.test(first) ? first : ''
 }
 
+/**
+ * A weapon row: the to-hit is the server's (`derived.weapons`, matched by
+ * name), and `sheet says +N` when the sheet writes another; the damage is the
+ * sheet's written one, else the data's dice, marked a guess. Its properties
+ * wait for the detail box; mastery shows only with Weapon Mastery.
+ */
 function weaponRows(e: Entry, dmNames: (name: string) => boolean): ActionRow[] {
   const wm = mastery(e)
+  const derived: any[] = Array.isArray(e.derived?.weapons) ? e.derived.weapons : []
+  const written: Record<string, unknown> = e.sheet.as_written?.weapon_attack ?? {}
+  const pend = e.derivedPending ? '?' : ''
   const out: ActionRow[] = []
   ;(e.sheet.inventory ?? []).forEach((i: any, n: number) => {
     const name = String(i.name ?? '')
-    const note = String(i.note ?? '')
     const hit = weaponFact(name, i.source, e.sheet.ruleset)
-    const writtenAttack = /^attack written /i.test(note.trim())
-    if (!hit && !writtenAttack) return
-    // The written bonus is the roll, labelled as written; the rest of the sheet's line follows the facts.
-    const parts = note ? weaponLine(note).split(' · ') : []
-    const lead = writtenAttack ? `ATK ${parts[0]} (as written)` : ''
-    const written = (writtenAttack ? parts.slice(1) : parts).join(' · ')
-    const base = { key: 'weapon-' + n, name, cls: '', dm: dmNames(name), always: false, lead, written, badges: [] as ActionRow['badges'] }
+    const dw = derived.find((w) => sameWeapon(String(w?.name ?? ''), name))
+    if (!hit && !dw) return
+    const base = { key: 'weapon-' + n, name, cls: '', dm: dmNames(name), always: false, badges: [] as ActionRow['badges'] }
     if (!hit) {
-      out.push({ ...base, effect: '', facts: ['Not in the rules snapshot'], missing: true, source: String(i.source ?? '') })
+      out.push({ ...base, effect: '', guess: false, lead: '', facts: ['Not in the rules snapshot'], missing: true, source: String(i.source ?? '') })
       return
     }
-    const [, , dice, type] = hit.row
-    const covered = !!wm && (wm.all || wm.names.some((w) => singular(w) === singular(norm(name))))
-    const effect = [dice, type].filter(Boolean).join(' ')
-    // A sheet line that only repeats the rules is not shown twice.
-    const same = written.toLowerCase() === effect.toLowerCase()
-    out.push({ ...base, written: same ? '' : written, effect, facts: weaponFacts(hit.row, covered), missing: false, source: hit.source })
+    const says = Object.entries(written).find(([k]) => sameWeapon(k, name))?.[1]
+    const attack = dw ? String(dw.attack) : ''
+    const [, , dice, type, , , , masteryName] = hit.row
+    const covered = !!wm && (wm.all || wm.names.some((w) => sameWeapon(w, name)))
+    const own = writtenDamage(String(i.note ?? ''))
+    out.push({
+      ...base,
+      effect: own || [dice, type].filter(Boolean).join(' '),
+      guess: !own,
+      lead: dw ? `ATK ${attack}${pend}` : '',
+      facts: [
+        ...(dw?.proficient === false ? ['not proficient'] : []),
+        ...(dw && says !== undefined && String(says) !== attack ? [`sheet says ${says}`] : []),
+        ...(covered && masteryName ? [masteryName] : []),
+      ],
+      missing: false,
+      source: hit.source,
+    })
   })
   return out
 }

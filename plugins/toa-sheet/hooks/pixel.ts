@@ -8,7 +8,7 @@
 // bloom: the Svg paints nothing but its pixels. Dark is the intended look; on
 // a light theme the pips vanish and the counts beside them stay.
 
-import { hpSegments, segments, TOKENS, type HpState, type Segment, type Tone } from './look.ts'
+import { hpSegments, noneSegments, segments, TOKENS, type HpState, type Segment, type Tone } from './look.ts'
 
 /** The Svg's own colours, beside look.ts's tokens: the Text tree uses the host's ink and `dimColor` instead. */
 const SVG = { ink: '#ededed', dim: '#9a9a9a', void: '#000000' } as const
@@ -18,7 +18,8 @@ const MAX_W = 300
 
 /**
  * The numeral font: 5×7, the HD44780 dot-matrix digits (a 1979 instrument's
- * own), a slashed zero, `1` `/` `-` three wide.
+ * own), a slashed zero, `1` `/` `-` three wide; `—` for a number never
+ * written, `~` for one last seen; `L` `V` for the level badge.
  */
 export const FONT: Record<string, string[]> = {
   '0': ['.###.', '#...#', '#..##', '#.#.#', '##..#', '#...#', '.###.'],
@@ -34,7 +35,11 @@ export const FONT: Record<string, string[]> = {
   '/': ['..#', '..#', '.#.', '.#.', '.#.', '#..', '#..'],
   '+': ['.....', '..#..', '..#..', '#####', '..#..', '..#..', '.....'],
   '-': ['...', '...', '...', '###', '...', '...', '...'],
+  '—': ['.....', '.....', '.....', '#####', '.....', '.....', '.....'],
+  '~': ['.....', '.....', '.##.#', '#..#.', '.....', '.....', '.....'],
   '?': ['.###.', '#...#', '....#', '...#.', '..#..', '.....', '..#..'],
+  L: ['#....', '#....', '#....', '#....', '#....', '#....', '#####'],
+  V: ['#...#', '#...#', '#...#', '#...#', '#...#', '.#.#.', '..#..'],
 }
 
 /** A character's glyph; an unknown one draws as `?`. */
@@ -85,12 +90,14 @@ const colourOf = (tone: Tone) => (tone === 'ink' ? SVG.ink : TOKENS[tone])
 
 /**
  * Cells `cw`×`ch` art px at scale 2, one art px apart, from (x, y): full solid
- * in the tone, spent a checkerboard of it, temp solid cyan. Returns the width.
+ * in the tone, spent a checkerboard of it, temp solid cyan, none a faint floor
+ * (never the checkerboard: that is spent). Returns the width.
  */
 function cells(p: ReturnType<typeof painter>, segs: Segment[], tone: Tone, x: number, y: number, cw: number, ch: number): number {
   const fill = colourOf(tone)
   segs.forEach((seg, k) => {
     const cx = x + k * (cw + 1) * 2
+    if (seg === 'none') return p.rect(cx, y + (ch - 1) * 2, cw * 2, 2, TOKENS.faint)
     if (seg !== 'spent') return p.rect(cx, y, cw * 2, ch * 2, seg === 'temp' ? TOKENS.cyan : fill)
     for (let j = 0; j < ch; j++) for (let i = 0; i < cw; i++) if ((i + j) % 2 === 0) p.rect(cx + i * 2, y + j * 2, 2, 2, fill)
   })
@@ -107,34 +114,75 @@ export function cellsSvg(segs: Segment[], tone: Tone, cw: number, ch: number, al
 /**
  * The HP instrument: the current HP at 4× in the state's colour (knocked out,
  * void on a plate of that colour under a quarter or while `flash`), `/max` dim
- * at 2× on its baseline, temp cyan, then the gauge centred beside it. Always
- * 36 CSS px high.
+ * at 2× on its baseline, temp cyan, then the gauge centred beside it, as many
+ * cells as fit in `width` CSS px (4 to 20). Always 36 CSS px high. `seen` puts
+ * a faint `~` before a last-seen value; `never` draws a faint `—` and an empty
+ * faint gauge (never the checkerboard: that is spent).
  */
-export function hpSvg(current: number, max: number, temp: number, state: HpState, opts: { flash?: boolean } = {}): Art {
+export function hpSvg(
+  current: number,
+  max: number,
+  temp: number,
+  state: HpState,
+  opts: { flash?: boolean; truth?: 'confirmed' | 'seen' | 'never'; width?: number } = {},
+): Art {
   const p = painter()
-  const cur = String(current)
+  const never = opts.truth === 'never'
+  let x = 0
+  if (opts.truth === 'seen') {
+    p.text('~', 0, 14, 2, TOKENS.faint)
+    x = textWidth('~') * 2 + 4
+  }
+  const cur = never ? '—' : String(current)
   const heroW = textWidth(cur) * 4
-  let x: number
-  if (opts.flash || state === 'alert') {
-    p.rect(0, 0, heroW + 8, 36, TOKENS[state])
-    p.text(cur, 4, 4, 4, SVG.void)
-    x = heroW + 10
+  if (!never && (opts.flash || state === 'alert')) {
+    p.rect(x, 0, heroW + 8, 36, TOKENS[state])
+    p.text(cur, x + 4, 4, 4, SVG.void)
+    x += heroW + 10
   } else {
-    p.text(cur, 0, 4, 4, TOKENS[state])
-    x = heroW + 4
+    p.text(cur, x, 4, 4, never ? TOKENS.faint : TOKENS[state])
+    x += heroW + 4
   }
   const rest = '/' + max
   p.text(rest, x, 18, 2, SVG.dim)
   x += textWidth(rest) * 2
-  if (temp > 0) {
+  if (temp > 0 && !never) {
     const t = '+' + temp
     p.text(t, x + 6, 18, 2, TOKENS.cyan)
     x += 6 + textWidth(t) * 2
   }
   x += 8
-  const room = Math.max(8, Math.min(20, Math.floor((MAX_W - x) / 10)))
-  const width = x + cells(p, hpSegments(current, max, temp, room), state, x, 11, 4, 7)
-  return { source: p.svg(width, 36), alt: `HP ${current} of ${max}` + (temp > 0 ? `, +${temp} temp` : ''), width, height: 36 }
+  const room = Math.max(4, Math.min(20, Math.floor(((opts.width ?? MAX_W) - x + 2) / 10)))
+  const segs = never ? noneSegments(room) : hpSegments(current, max, temp, room)
+  const width = x + cells(p, segs, state, x, 11, 4, 7)
+  const alt = never ? `HP not on the sheet, max ${max}` : `HP ${current} of ${max}` + (temp > 0 ? `, +${temp} temp` : '') + (opts.truth === 'seen' ? ', last seen' : '')
+  return { source: p.svg(width, 36), alt, width, height: 36 }
+}
+
+/**
+ * A glance value beside the HP, in its 36 px box: at 4× level with the HP's
+ * numerals, or at 2× on its `/max` baseline.
+ */
+export function readoutSvg(s: string, scale: 2 | 4, tone: Tone, alt: string): Art {
+  const p = painter()
+  const w = textWidth(s) * scale
+  p.text(s, 0, scale === 4 ? 4 : 18, scale, colourOf(tone))
+  return { source: p.svg(w, 36), alt, width: w, height: 36 }
+}
+
+/** The level badge, 40 CSS px high: a frame round `LV` (dim, 2×) on the baseline of the level (4×). */
+export function badgeSvg(lv: string, tone: Tone, alt: string): Art {
+  const p = painter()
+  const fill = colourOf(tone)
+  const numX = 6 + textWidth('LV') * 2 + 6
+  const w = numX + textWidth(lv) * 4 + 6
+  p.rect(0, 0, w, 2, fill)
+  p.rect(0, 38, w, 2, fill)
+  p.rect(0, 2, 2, 36, fill)
+  p.rect(w - 2, 2, 2, 36, fill)
+  p.text('LV', 6, 20, 2, SVG.dim)
+  p.text(lv, numX, 6, 4, fill)
+  return { source: p.svg(w, 40), alt, width: w, height: 40 }
 }
 
 /** Pips: 4×4 cells, one per use while they fit in 10, else a 10-cell meter. */

@@ -9,7 +9,8 @@ export type Member = { hp: number; max: number; working: number[]; dead: boolean
 export type Row = { id: string; side: Side; name: string; init: number | null; ac: number | null; members: Member[]; out: boolean; down: boolean; downs: number[]; added: number }
 /** An op as `describe` renders it; `working` is an HP op's result (`22 − 9 = 13`). */
 export type LogLine = { at: number; text: string; working?: string; reverted?: true }
-export type Fight = { id: string; startedAt: number; rows: Row[]; pointer: string | null; round: number; ended: number | null; log: LogLine[] }
+/** `packs` names the packs loaded into it, in order (an undone one is not). */
+export type Fight = { id: string; startedAt: number; rows: Row[]; pointer: string | null; round: number; ended: number | null; log: LogLine[]; packs: string[] }
 export type AddOp = { op: 'add'; name: string; count: number; hp: number | null; ac: number | null; init: number | null }
 /** One press. `name` on `init`/`down` is the PC's roster name: its row is made on first mention. A `pack` is a combat pack's adds as one press. */
 export type Op =
@@ -59,10 +60,16 @@ function nextRow(f: Fight): { row: Row; wraps: boolean } | null {
   return first ? { row: first, wraps: true } : null
 }
 
-/** `▶ NUX then DIEGO · ROUND 2`, or `NO POINTER · n, or pick a row and t` before the first. */
+/** The row on deck: where `n` would move the pointer, unless that is the current row. */
+export function onDeck(f: Fight): string | null {
+  const next = nextRow(f)
+  return next && next.row.id !== f.pointer ? next.row.id : null
+}
+
+/** `▶ NUX then DIEGO · ROUND 2`, or `NO POINTER · next turn, or a row's turn` before the first. */
 export function statusText(f: Fight): string {
   const cur = f.rows.find((r) => r.id === f.pointer)
-  if (!cur) return 'NO POINTER · n, or pick a row and t'
+  if (!cur) return "NO POINTER · next turn, or a row's turn"
   const next = nextRow(f)
   const then = next && next.row !== cur ? ` then ${next.row.name.toUpperCase()}` : ''
   return `▶ ${cur.name.toUpperCase()}${then}` + (f.round ? ` · ROUND ${f.round}` : '')
@@ -102,7 +109,7 @@ export function describe(o: Op, f: Fight | null): string {
   if (o.op === 'out') return `${named(f, o.row)} out`
   if (o.op === 'down') return `${o.name} ${o.value ? 'down' : 'up'}`
   if (o.op === 'point') return `▶ ${named(f, o.row)}`
-  return o.op === 'next' ? 'n' : 'end'
+  return o.op === 'next' ? 'next turn' : 'end'
 }
 
 /**
@@ -137,7 +144,10 @@ function applyOp(f: Fight, o: Op, i: number, at: number): { working?: string } |
   const r = 'row' in o ? f.rows.find((x) => x.id === o.row) : undefined
   if (o.op === 'add') addRow(f, o, 'm' + i, i)
   // A pack's rows share its event index, so one undo takes them all; they order as listed.
-  else if (o.op === 'pack') o.rows.forEach((a, k) => addRow(f, a, `m${i}.${k}`, i))
+  else if (o.op === 'pack') {
+    o.rows.forEach((a, k) => addRow(f, a, `m${i}.${k}`, i))
+    f.packs.push(o.name)
+  }
   else if (o.op === 'init' || o.op === 'down') {
     const row = r ?? { id: o.row, side: 'pc' as const, name: o.name, init: null, ac: null, members: [], out: false, down: false, downs: [], added: i }
     if (!r) f.rows.push(row)
@@ -188,7 +198,7 @@ export function fold(events: Event[]): Fight | null {
     if ('undo' in e) return
     const text = describe(e.op, f)
     if (undone.has(i)) return void f?.log.push({ at: e.at, text, reverted: true })
-    if (!live(f) && starts(e.op)) f = { id: 'F' + e.at, startedAt: e.at, rows: [], pointer: null, round: 0, ended: null, log: [] }
+    if (!live(f) && starts(e.op)) f = { id: 'F' + e.at, startedAt: e.at, rows: [], pointer: null, round: 0, ended: null, log: [], packs: [] }
     const result = live(f) ? applyOp(f!, e.op, i, e.at) : false
     if (!result) return void f?.log.push({ at: e.at, text: '? ' + text })
     f!.log.push({ at: e.at, text, ...result })
@@ -196,35 +206,69 @@ export function fold(events: Event[]): Fight | null {
   return f
 }
 
-export type Pack = { name: string; rows: AddOp[] }
+/** A packet's notes section: its `### ` heading, that line's number, and its lines as written. */
+export type Section = { heading: string; line: number; lines: string[] }
+/** A pack: its `## ` heading and line, the `# ` section it sits under (`S05`, or null), its groups and its notes. */
+export type Pack = { name: string; line: number; section: string | null; rows: AddOp[]; notes: Section[] }
 
 /**
- * The combat packs in `Prep/Fights.md`: each `## ` heading a pack, each
- * non-blank line under it a group, `<name> [xN|×N] [hp N] [ac N] [init N]`.
- * Lines before the first heading are ignored. A pack with a line that does not
- * read is refused whole; `errors` names the line, `Fights.md L7: …`.
+ * The combat packs in `Prep/Fights.md`. A `# ` heading (`# S05`) opens a
+ * session's section and closes the pack before it. Each `## ` heading is a
+ * pack; each non-blank line under it a group, `<name> [xN|×N] [hp N] [ac N]
+ * [init N]`, with at least one field. From the pack's first `### ` heading on,
+ * its lines are notes, kept as written, never read as groups. Lines outside a
+ * pack are ignored. A pack with a line that does not read is refused whole;
+ * `errors` names the line, `Fights.md L7: …`.
  */
 export function parsePacks(text: string): { packs: Pack[]; errors: string[] } {
   const packs: Pack[] = []
   const errors: string[] = []
-  let cur: { name: string; line: number; rows: AddOp[]; error: string | null } | null = null
+  let section: string | null = null
+  let cur: (Pack & { error: string | null }) | null = null
+  const trimNote = () => {
+    const open = cur?.notes[cur.notes.length - 1]
+    while (open && open.lines.length && !open.lines[open.lines.length - 1]!.trim()) open.lines.pop()
+  }
   const close = () => {
     if (!cur) return
+    trimNote()
     if (!cur.error && !cur.rows.length) cur.error = `Fights.md L${cur.line}: "${cur.name}" has no groups`
     if (cur.error) errors.push(cur.error)
-    else packs.push({ name: cur.name, rows: cur.rows })
+    else packs.push({ name: cur.name, line: cur.line, section: cur.section, rows: cur.rows, notes: cur.notes })
+    cur = null
   }
-  text.split(/\r?\n/).forEach((raw, n) => {
+  // An HTML comment is not the pack's, however many lines it runs (a pasted
+  // Templates/Fights.md carries its example in one); an unclosed one runs to the
+  // end. Its newlines stay, so line numbers still match the file.
+  const shown = text.replace(/<!--[\s\S]*?(?:-->|$)/g, (c) => c.replace(/[^\n]/g, ''))
+  shown.split(/\r?\n/).forEach((raw, n) => {
     const line = raw.trim()
-    const heading = /^##(?:\s+(.*))?$/.exec(line)
-    if (heading) {
+    const head = /^(#{1,3})(?:\s+(.*))?$/.exec(line)
+    const title = (head?.[2] ?? '').trim()
+    if (head?.[1] === '#') {
       close()
-      cur = { name: (heading[1] ?? '').trim(), line: n + 1, rows: [], error: null }
+      section = title || null
+      return
+    }
+    if (head?.[1] === '##') {
+      close()
+      cur = { name: title, line: n + 1, section, rows: [], notes: [], error: null }
       if (!cur.name) cur.error = `Fights.md L${n + 1}: a pack needs a name`
       return
     }
-    if (!cur || !line || cur.error) return
-    const read = readGroup(line)
+    if (!cur || cur.error) return
+    if (head?.[1] === '###') {
+      trimNote()
+      cur.notes.push({ heading: title, line: n + 1, lines: [] })
+      return
+    }
+    const note = cur.notes[cur.notes.length - 1]
+    if (note) {
+      if (line || note.lines.length) note.lines.push(raw)
+      return
+    }
+    if (!line) return
+    const read = line.startsWith('#') ? `can't read "${line}"` : readGroup(line)
     if (typeof read === 'string') cur.error = `Fights.md L${n + 1}: ${read}`
     else cur.rows.push(read)
   })
@@ -232,7 +276,7 @@ export function parsePacks(text: string): { packs: Pack[]; errors: string[] } {
   return { packs, errors }
 }
 
-/** One group line as an add, or why it does not read. */
+/** One group line as an add, or why it does not read: a line with no field is no group. */
 function readGroup(line: string): AddOp | string {
   const bad = `can't read "${line}"`
   const words = line.replace(/^-\s+/, '').split(/\s+/)
@@ -255,8 +299,34 @@ function readGroup(line: string): AddOp | string {
     got[slot] = Number(value)
   }
   const text = name.join(' ')
-  if (!text || got.count === 0) return bad
+  if (!text || !Object.keys(got).length || got.count === 0) return bad
   const count = got.count ?? 1
   if (count > 1 && got.hp === undefined) return 'a group needs HP'
   return { op: 'add', name: text.charAt(0).toUpperCase() + text.slice(1), count, hp: got.hp ?? null, ac: got.ac ?? null, init: got.init ?? null }
+}
+
+/** The last pack loaded and not undone, over fight logs newest first, or null. */
+export function lastPack(logs: Event[][]): string | null {
+  for (const events of logs) {
+    const undone = undoneOf(events)
+    for (let i = events.length - 1; i >= 0; i--) {
+      const e = events[i]!
+      if ('op' in e && e.op.op === 'pack' && !undone.has(i)) return e.op.name
+    }
+  }
+  return null
+}
+
+/** The packs `[ next ]` walks: the `# ` section named `session`, or the whole file when there is none. */
+export function sessionPacks(packs: Pack[], session: string | null): Pack[] {
+  const s = session?.trim().toUpperCase()
+  const own = s ? packs.filter((p) => p.section?.toUpperCase() === s) : []
+  return own.length ? own : packs
+}
+
+/** The pack `[ next ]` loads: the one after `last` in the session's packs, else their first. */
+export function nextPack(packs: Pack[], session: string | null, last: string | null): Pack | null {
+  const scope = sessionPacks(packs, session)
+  const at = last === null ? -1 : scope.findIndex((p) => p.name === last)
+  return (at >= 0 ? scope[at + 1] : undefined) ?? scope[0] ?? null
 }

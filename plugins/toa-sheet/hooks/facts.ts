@@ -994,3 +994,28 @@ export const WEAPONS: Record<string, WeaponRow> = {
 "whip|xphb":["martial","melee","1d4","slashing","","Finesse,Reach","","Slow"],
 "yklwa|toa":["simple","melee","1d8","piercing","","Thrown","10/30",""],
 }
+
+/** Where SKILLS is printed: XPHB, Proficiency > Skill Proficiencies, the Skills table. */
+export const SKILLS_CITE = 'XPHB p.14'
+
+/** Each skill, lower-cased, to the ability it is checked with. */
+export const SKILLS: Record<string, string> = {
+"acrobatics":"dex",
+"animal handling":"wis",
+"arcana":"int",
+"athletics":"str",
+"deception":"cha",
+"history":"int",
+"insight":"wis",
+"intimidation":"cha",
+"investigation":"int",
+"medicine":"wis",
+"nature":"int",
+"perception":"wis",
+"performance":"cha",
+"persuasion":"cha",
+"religion":"int",
+"sleight of hand":"dex",
+"stealth":"dex",
+"survival":"wis",
+}
