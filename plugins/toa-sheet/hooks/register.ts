@@ -244,7 +244,7 @@ function leave() {
 async function back($: EngineInterface) {
   popScreen()
   $.ui.invalidate('ui.render')
-  await openPane($)
+  await openPane($, true)
   if (top() === 'look') await focusOn($, 'look-field')
 }
 
@@ -306,10 +306,11 @@ async function openSheet($: EngineInterface, id: string) {
 }
 
 /** Esc in a field, or its `[ cancel ]`: the field or form closes and the keys go back to a Button. */
-function cancel($: EngineInterface) {
+async function cancel($: EngineInterface) {
   const was = tap
   leave()
   $.ui.invalidate('ui.render')
+  await openPane($, wantsEsc())
   return was ? focusOn($, 'tap-d') : park($)
 }
 
@@ -1176,19 +1177,20 @@ export function register(on: On) {
   // Esc, or the close mark (one origin for both). The order: an open field or form
   // closes first, then an open box (T0093), then a pushed screen pops, and the pane
   // stays; on the stack's root the pane closes (a lone sheet), or, on `[party]`, Esc
-  // is not asked for (`wantsEsc`) and goes to the chat.
+  // is not asked for (`wantsEsc`) and goes to the chat. The engine latches prompt
+  // Esc off after a refused close: re-open with focus to clear it and return the
+  // keys to the pane while Esc is still wanted.
   on('ui.close', async ($, e, next) => {
     if (e.id !== PANE) return next(e)
     if (e.origin?.kind === 'person') {
       if (ask || tap || adding || split !== null) {
         await cancel($)
-        await syncEsc($)
         return { value: undefined }
       }
       if (detail) {
         detail = null
         $.ui.invalidate('ui.render')
-        await syncEsc($)
+        await openPane($, wantsEsc())
         return { value: undefined }
       }
       // The look's field is a screen, not a field: Esc there pops.
@@ -1379,7 +1381,7 @@ export function register(on: On) {
         $.ui.invalidate('ui.render')
         return { element: id }
       } else if (id === 'detail-reread') {
-        await refresh($, consent('re-read', top() === 'sheet' ? 'Sheet' : 'Party'))
+        await refresh($, consent('re-read', top() === 'sheet' ? 'Sheet' : 'Party'), true)
         return { element: id }
       } else if (id === 'detail-more') {
         const pane = top() === 'sheet' ? 'Sheet' : 'Party'
