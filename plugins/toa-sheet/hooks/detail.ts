@@ -9,22 +9,66 @@
 // `w:save:<ability>`, `w:skill:<name>`, `w:res:<index>` on the focused sheet;
 // `w:cond:<entry id>:<condition>`, `w:seen:<entry id>`, `w:req:<entry id>` on
 // any cached sheet. A word is drawn only where `detailOf` has a box for it.
+//
+// Inside a box (Layer 2) a rules term is a word too. `w:n:<target>` nests: its
+// press pushes `w:<target>` onto the open box's path (`w:n:g:heavy` opens the
+// glossary's Heavy in place, `w:n:skill:Athletics` the skill's box), the title
+// becomes the path's breadcrumb and `[ ‹ ]` pops a level. `w:c:<kind>:<name>`
+// opens T0085's card, which the rules server fills: `w:c:spell:<name>`,
+// `w:c:monster:<name>`, `w:c:option:<kind>|<name>|<feature>[|<row>]` (character_option_get).
 
 import type { Elements, RenderElement, RenderNode } from 'claude-code'
 import { cantripDice, mastery, norm, sameWeapon, spellFact, weaponFact, writtenDamage } from './actions.ts'
 import { SKILLS, SKILLS_CITE, SPELL_ALIASES, SPELLS } from './facts.ts'
-import { CONDITIONS, SCHOOLS, type Candidate } from './lookup.ts'
+import { GLOSSARY } from './glossary.ts'
+import { CONDITIONS, SCHOOLS, type Candidate, type Card } from './lookup.ts'
 import { TOKENS } from './look.ts'
 import { describeChange, type Entry } from './sheet.ts'
 
-/** The open box: the word it hangs from, and the terms opened inside it (Layer 2 nests; Layer 1 holds one). */
-export type Detail = { anchor: string; path: string[] }
+/**
+ * The open box: the word it hangs from, and the terms opened inside it, the
+ * anchor first. `above`: a pinned preview (Layer 3), drawn above the word, not under its row.
+ */
+export type Detail = { anchor: string; path: string[]; above?: true }
 
-/** A press on a word: its box opens, replacing any other; a press on the open one closes it. */
-export const pressWord = (state: Detail | null, key: string): Detail | null => (state?.anchor === key ? null : { anchor: key, path: [key] })
+/**
+ * The hover preview (Layer 3): the word's card above it, and a term's card
+ * above that (one level on hover); `pinned` once a click locked it.
+ */
+export type Preview = { anchor: string; top: Content; nested: Content | null; pinned: boolean }
 
-/** A run of a line: values bold, labels faint, a warning amber. */
-export type Piece = { text: string; tone?: 'value' | 'label' | 'warn' }
+/** The deepest a box nests: at this depth its words are plain text. */
+const DEPTH = 3
+
+/**
+ * A press on a word: its box opens, replacing any other; a press on the open
+ * one closes it. A term inside the open box (`w:n:`) nests its box on the path,
+ * while the path is shallower than DEPTH and does not hold it already.
+ */
+export const pressWord = (state: Detail | null, key: string): Detail | null => {
+  if (!key.startsWith('w:n:')) return state?.anchor === key ? null : { anchor: key, path: [key] }
+  const to = 'w:' + key.slice('w:n:'.length)
+  return state && state.path.length < DEPTH && !state.path.includes(to) ? { ...state, path: [...state.path, to] } : state
+}
+
+/** A `w:c:` word's card, or null for any other key. */
+export function wordCard(key: string): Candidate | null {
+  const m = /^w:c:(spell|monster|option):(.+)$/.exec(key)
+  if (!m) return null
+  const [, kind, rest] = m as unknown as [string, 'spell' | 'monster' | 'option', string]
+  if (kind === 'option') {
+    // Only a class or subclass takes one feature; any other option opens whole.
+    // A species' card shows the pressed trait (its name the candidate's), from
+    // the one answer. A fourth part, the row, only keeps each word's key its own.
+    const [k, name, feature] = rest.split('|')
+    const one = k === 'class' || k === 'subclass' ? feature : ''
+    return { name: one || (k === 'species' && feature) || name!, kind, key: `${k}|${name}|${one}` }
+  }
+  return { name: rest, kind, key: kind === 'spell' ? norm(rest) + '|xphb' : norm(rest) }
+}
+
+/** A run of a line: values bold, labels faint, a warning amber; with a `key`, a word. */
+export type Piece = { text: string; tone?: 'value' | 'label' | 'warn'; key?: string }
 /** Pieces that never break apart; a line wraps only between units. */
 type Unit = Piece[]
 
@@ -37,6 +81,10 @@ export interface Content {
   more: Candidate | null
   /** `[ re-read ]`: the sheet's re-read. */
   reread: boolean
+  /** `[ ‹ ]`: the box is nested; it pops a level. */
+  back?: boolean
+  /** Long text: past six rows it ends at a sentence, and `[ more ]` shows the rest (no `[ more ]` when it fits). */
+  cut?: boolean
 }
 
 const val = (text: string): Piece => ({ text, tone: 'value' })
@@ -68,6 +116,53 @@ const ago = (ms: number) => {
 }
 /** The pending number's warning: `derived` is the server's, and a write since may change it. */
 const PENDING: Unit[] = prose('the server has not derived this yet', 'warn')
+
+/** A glossary term, a word that nests its entry; plain where the glossary has none (Ritual). */
+const term = (text: string, tone?: Piece['tone'], key = text.toLowerCase()): Piece => ({ text, ...(tone ? { tone } : {}), ...(GLOSSARY[key] ? { key: 'w:n:g:' + key } : {}) })
+
+/** The fetch kinds a glossary link names (build.py's FETCH_KINDS), as the word each is; `classFeature` names no class, so stays text. */
+const FETCH: Record<string, (name: string) => string> = {
+  spell: (n) => 'w:c:spell:' + n,
+  creature: (n) => 'w:c:monster:' + n,
+  item: (n) => 'w:c:option:item|' + n + '|',
+  feat: (n) => 'w:c:option:feat|' + n + '|',
+  skill: (n) => 'w:n:skill:' + n,
+}
+/** A link in glossary text, `⟦key|shown⟧` or `⟦kind:name|shown⟧`, as its word. */
+function link(target: string, shown: string): Piece {
+  const at = target.indexOf(':')
+  if (at < 0) return { text: shown, key: 'w:n:g:' + target }
+  const to = FETCH[target.slice(0, at)]
+  return to ? { text: shown, key: to(target.slice(at + 1)) } : plain(shown)
+}
+/**
+ * Glossary text as lines of units: words wrap apart; a link and the punctuation
+ * touching it stay one unit. A link to a target already linked is text: a key
+ * is drawn once (Light's three Bonus Actions).
+ */
+const glossLines = (text: string): Unit[][] => {
+  const linked = new Set<string>()
+  return text.split('\n').map((line) => {
+    const units: Unit[] = []
+    let cur: Unit = []
+    const flush = () => (cur.length && units.push(cur), (cur = []))
+    for (const part of line.split(/(⟦[^⟧]*⟧)/)) {
+      const m = /^⟦([^|⟧]*)\|([^⟧]*)⟧$/.exec(part)
+      if (m) cur.push(linked.has(m[1]!) ? plain(m[2]!) : (linked.add(m[1]!), link(m[1]!, m[2]!)))
+      else for (const w of part.split(/(\s+)/)) /^\s+$/.test(w) ? flush() : w && cur.push(plain(w))
+    }
+    flush()
+    return units
+  })
+}
+
+/** A glossary entry (`w:g:<key>`): its SRD 5.2.1 text and page, cut long with `[ more ]` to the whole. */
+function glossaryBox(key: string): Content | null {
+  const g = GLOSSARY[key]
+  if (!g) return null
+  const [title, text, source, page] = g
+  return { title, lines: glossLines(text), cite: `${source} p.${page}`, more: { name: title, kind: 'glossary', key }, reread: false, cut: true }
+}
 
 /**
  * `ABIL +mod`, then what proficiency adds, then any rest: the server's total
@@ -115,14 +210,14 @@ function weaponBox(e: Entry, n: number): Content | null {
       [val(category)],
       [val(kind)],
       ...(props ? props.split(',') : []).map((p): Unit => {
-        if ((p === 'Thrown' || p === 'Ammunition') && range) return [val(p + ' ' + range)]
-        if (p === 'Heavy' && score(heavy) !== null) return [val('Heavy'), lab(` (your ${heavy.toUpperCase()} ${score(heavy)})`)]
-        return [val(p)]
+        if ((p === 'Thrown' || p === 'Ammunition') && range) return [term(p, 'value'), val(' ' + range)]
+        if (p === 'Heavy' && score(heavy) !== null) return [term('Heavy', 'value'), lab(` (your ${heavy.toUpperCase()} ${score(heavy)})`)]
+        return [term(p, 'value')]
       }),
     ]),
   )
   const wm = mastery(e)
-  if (masteryName && wm && (wm.all || wm.names.some((w) => sameWeapon(w, name)))) lines.push([[lab('mastery '), val(masteryName)]])
+  if (masteryName && wm && (wm.all || wm.names.some((w) => sameWeapon(w, name)))) lines.push([[lab('mastery '), term(masteryName, 'value')]])
   const says = Object.entries((e.sheet.as_written?.weapon_attack ?? {}) as Record<string, unknown>).find(([k]) => sameWeapon(k, name))?.[1]
   if (dw && says !== undefined && String(says) !== String(dw.attack)) lines.push([[lab('the sheet says '), val(String(says))]])
   if (dw && e.derivedPending) lines.push(PENDING)
@@ -142,13 +237,13 @@ function spellBox(e: Entry, spell: any, cls: string): Content | null {
   if (caster && (flags.includes('melee') || flags.includes('ranged'))) {
     const atk = num(caster.attack)
     lines.push([[val((atk === null ? String(caster.attack) : signed(atk)) + q), plain(' to hit')], [lab(`(${cls})`)]])
-  } else if (caster && save) lines.push(dots([[val(save), plain(' save')], [lab('DC '), val(String(caster.save_dc) + q), lab(` (${cls})`)]]))
+  } else if (caster && save) lines.push(dots([[val(save), plain(' '), term('save', undefined, 'saving throw')], [lab('DC '), val(String(caster.save_dc) + q), lab(` (${cls})`)]]))
   const total = num(d.total_level)
   const dice = level === 0 ? cantripDice(diceText, total) : diceText
   if (damage) lines.push([[val(dice)], ...prose(damage.split(',').join(', '))].filter((u) => u[0]!.text))
   else if (flags.includes('heal') && dice) lines.push([[lab('heal '), val(dice + (flags.includes('mod') ? ' + mod' : ''))]])
   const tags = [...(flags.includes('conc') ? ['Concentration'] : []), ...(flags.includes('ritual') ? ['Ritual'] : [])]
-  if (tags.length) lines.push(dots(tags.map((t) => [val(t)])))
+  if (tags.length) lines.push(dots(tags.map((t) => [term(t, 'value')])))
   if (caster && e.derivedPending) lines.push(PENDING)
   // The card fetches the spell by name; the facts row is the one this box read.
   const n = norm(name)
@@ -209,19 +304,18 @@ function resourceBox(e: Entry, i: number): Content | null {
   return { title: String(r.name), lines, cite: 'sheet', more: null, reread: false }
 }
 
-/** A condition on the sheet: its name (no duration field exists yet), exhaustion's level, the card a press away. */
+/** A condition on the sheet: exhaustion's level, then the rule from the glossary (no duration field exists yet). */
 function conditionBox(e: Entry, cond: string): Content | null {
   const known = CONDITIONS.find((c) => norm(c) === norm(cond))
   if (!known) return null
   const level = num(e.sheet.exhaustion) ?? 0
   const ok = known === 'Exhaustion' ? level > 0 : (e.sheet.conditions ?? []).some((c: unknown) => norm(String(c)) === norm(cond))
-  if (!ok) return null
+  const rule = ok && glossaryBox(known.toLowerCase())
+  if (!rule) return null
   return {
-    title: known,
-    lines: known === 'Exhaustion' ? [[[lab('level '), val(String(level))]]] : [],
-    cite: 'sheet',
-    more: { name: known, kind: 'condition', key: norm(known) },
-    reread: false,
+    ...rule,
+    lines: [...(known === 'Exhaustion' ? [[[lab('level '), val(String(level))]]] : []), ...rule.lines],
+    cite: rule.cite + ' · sheet',
   }
 }
 
@@ -276,19 +370,51 @@ export function detailOf(key: string, rows: Entry[], focused: Entry | null, now:
       const e = byId(rest)
       return e ? requestBox(e) : null
     }
+    case 'g':
+      return glossaryBox(rest)
+    case 'n':
+      return detailOf('w:' + rest, rows, focused, now)
     default:
       return null
   }
+}
+
+/**
+ * The open box: the top of `path`, titled with the whole path (`Greatsword ›
+ * Heavy › Disadvantage`), `[ ‹ ]` while nested. A word stays a word only once
+ * per box, never to a box already on the path, never at the last depth, and
+ * only where it opens something.
+ */
+export function detailAt(path: string[], rows: Entry[], focused: Entry | null, now: number): Content | null {
+  const all = path.map((k) => detailOf(k, rows, focused, now))
+  const top = all.at(-1)
+  if (!top) return null
+  const taken = new Set(path)
+  const live = (k: string) => {
+    const to = k.startsWith('w:n:') ? 'w:' + k.slice('w:n:'.length) : k
+    if (path.length >= DEPTH || taken.has(to) || !(k.startsWith('w:c:') || detailOf(k, rows, focused, now))) return false
+    taken.add(to)
+    return true
+  }
+  const lines = top.lines.map((l) => l.map((u) => u.map(({ key, ...p }) => (key && live(key) ? { ...p, key } : p))))
+  return { ...top, title: all.map((c) => c?.title ?? '…').join(' › '), lines, back: path.length > 1 }
 }
 
 // ------------------------------------------------------------------ drawing
 
 type El = Pick<Elements['mobile'], 'Box' | 'Text'>
 type Make = (props: { key: string; label: string }) => RenderElement
+/** Draws a keyed piece as its word (view.ts's `word`), which falls back to plain text. */
+type Word = (key: string, label: string, style: { bold?: true; dimColor?: true; color?: string }) => RenderNode
 
-/** The most body rows a box draws; past it, a faint `and N more` (never `…`). */
+/** A piece's style: values bold, labels faint, a warning amber. */
+const look = (p: Piece): { bold?: true; dimColor?: true; color?: string } =>
+  p.tone === 'value' ? { bold: true } : p.tone === 'label' ? { dimColor: true } : p.tone === 'warn' ? { color: TOKENS.amber } : {}
+
+/** The most body rows a box draws; past it, a faint `and N more`, or long text's sentence cut (never `…`). */
 const MAX_ROWS = 6
 const width = (u: Unit) => u.reduce((n, p) => n + p.text.length, 0)
+const SENTENCE_END = /[.!?]["”’)\]]*$/
 
 /**
  * Items in rows of at most `w` columns, `gap` between them: the greedy wrap.
@@ -314,31 +440,41 @@ export function greedy<T>(items: T[], width: (t: T) => number, w: number, gap = 
 }
 
 /**
- * The box: a round border as wide as the pane's body, the title and `[ × ]`,
- * up to six rows (each a nowrap row the wrap laid out), then `[ more ]` or
- * `[ re-read ]` and the faint cite at the bottom right. Its Buttons carry no
- * hotkey.
+ * The body's rows at `w` columns, at most six: past them long text ends at a
+ * sentence (`cut`), any other drops whole lines and counts them in `more`.
  */
-export function detailBox(el: El, make: Make, c: Content, columns: number): RenderElement {
+function bodyRows(c: Content, w: number): { rows: Unit[][]; more: number; cut: boolean } {
+  const laid = c.lines.map((l) => greedy(l, width, w))
+  if (laid.reduce((n, rs) => n + rs.length, 0) <= MAX_ROWS) return { rows: laid.flat(), more: 0, cut: false }
+  if (c.cut) {
+    // The first six rows, ended after their last sentence; `[ more ]` has the rest.
+    const ends = (u: Unit) => SENTENCE_END.test(u.at(-1)?.text ?? '')
+    const rows = laid.flat().slice(0, MAX_ROWS)
+    const r = rows.findLastIndex((row) => row.some(ends))
+    return { rows: r < 0 ? rows : [...rows.slice(0, r), rows[r]!.slice(0, rows[r]!.findLastIndex(ends) + 1)], more: 0, cut: true }
+  }
+  const rows: Unit[][] = []
+  let k = 0
+  for (; k < laid.length && rows.length + laid[k]!.length <= MAX_ROWS - 1; k++) rows.push(...laid[k]!)
+  return { rows, more: laid.length - k, cut: false }
+}
+
+/**
+ * The box: a round border as wide as the pane's body, the title (the path's
+ * breadcrumb), `[ ‹ ]` while nested and `[ × ]`, up to six rows (each a
+ * nowrap row the wrap laid out), then `[ more ]` or `[ re-read ]` and the
+ * faint cite at the bottom right. A keyed piece is drawn by `word`. Its
+ * Buttons carry no hotkey.
+ */
+export function detailBox(el: El, make: Make, c: Content, columns: number, word: Word): RenderElement {
   const inner = Math.max(8, columns - 4)
-  const span = (p: Piece) =>
-    el.Text({ children: [p.text], ...(p.tone === 'value' ? { bold: true } : p.tone === 'label' ? { dimColor: true } : p.tone === 'warn' ? { color: TOKENS.amber } : {}) })
+  const span = (p: Piece) => (p.key ? word(p.key, p.text, look(p)) : el.Text({ children: [p.text], ...look(p) }))
   const drawRow = (r: Unit[]) =>
     el.Box({ flexDirection: 'row', columnGap: 1, children: r.map((u) => el.Box({ flexDirection: 'row', flexShrink: 0, children: u.map(span) })) })
-  const laid = c.lines.map((l) => greedy(l, width, inner))
-  const total = laid.reduce((n, rs) => n + rs.length, 0)
-  const body: RenderNode[] = []
-  if (total <= MAX_ROWS) for (const rs of laid) body.push(...rs.map(drawRow))
-  else {
-    let shown = 0
-    let k = 0
-    for (; k < laid.length && shown + laid[k]!.length <= MAX_ROWS - 1; k++) {
-      body.push(...laid[k]!.map(drawRow))
-      shown += laid[k]!.length
-    }
-    body.push(el.Text({ children: [`and ${laid.length - k} more`], dimColor: true }))
-  }
-  const buttons = [...(c.more ? [make({ key: 'detail-more', label: 'more' })] : []), ...(c.reread ? [make({ key: 'detail-reread', label: 're-read' })] : [])]
+  const { rows, more, cut } = bodyRows(c, inner)
+  const body: RenderNode[] = rows.map(drawRow)
+  if (more) body.push(el.Text({ children: [`and ${more} more`], dimColor: true }))
+  const buttons = [...(c.more && (!c.cut || cut) ? [make({ key: 'detail-more', label: 'more' })] : []), ...(c.reread ? [make({ key: 'detail-reread', label: 're-read' })] : [])]
   return el.Box({
     key: 'detail',
     borderStyle: 'round',
@@ -349,7 +485,11 @@ export function detailBox(el: El, make: Make, c: Content, columns: number): Rend
       el.Box({
         flexDirection: 'row',
         columnGap: 1,
-        children: [el.Box({ flexGrow: 1, flexShrink: 1, children: [el.Text({ children: [c.title], bold: true, wrap: 'wrap' })] }), el.Box({ flexShrink: 0, children: [make({ key: 'detail-x', label: '×' })] })],
+        children: [
+          el.Box({ flexGrow: 1, flexShrink: 1, children: [el.Text({ children: [c.title], bold: true, wrap: 'wrap' })] }),
+          ...(c.back ? [el.Box({ flexShrink: 0, children: [make({ key: 'detail-back', label: '‹' })] })] : []),
+          el.Box({ flexShrink: 0, children: [make({ key: 'detail-x', label: '×' })] }),
+        ],
       }),
       ...body,
       el.Box({
@@ -360,4 +500,42 @@ export function detailBox(el: El, make: Make, c: Content, columns: number): Rend
       }),
     ],
   })
+}
+
+// ------------------------------------------------------------------ the preview
+
+/** One run of a preview row, as card.tsx draws it: a `key` makes it a term. */
+export type Cell = { text: string; bold?: true; dimColor?: true; color?: string; key?: string }
+
+/**
+ * A box as the preview's rows at `columns` (card.tsx pads a column each side):
+ * the title, the body as the box lays it out, the faint cite. `more`: the box
+ * would draw `[ more ]`, which the preview draws once pinned.
+ */
+export function cardRows(c: Content, columns: number): { rows: Cell[][]; more: boolean } {
+  const inner = Math.max(8, columns - 2)
+  const cell = (p: Piece): Cell => ({ text: p.text, ...look(p), ...(p.key ? { key: p.key } : {}) })
+  const line = (r: Unit[]): Cell[] => r.flatMap((u, i) => [...(i ? [{ text: ' ' }] : []), ...u.map(cell)])
+  const { rows, more, cut } = bodyRows(c, inner)
+  const faint = (text: string): Cell[] => [{ text, dimColor: true }]
+  return {
+    rows: [
+      ...greedy(c.title.split(' '), (w) => w.length, inner).map((ws): Cell[] => [{ text: ws.join(' '), bold: true }]),
+      ...rows.map(line),
+      ...(more ? [faint(`and ${more} more`)] : []),
+      ...(c.cite ? [faint(c.cite)] : []),
+    ],
+    more: !!c.more && (!c.cut || cut),
+  }
+}
+
+/**
+ * A fetch word's preview: hover never fetches, so it is this session's cached
+ * card, or the name, its kind and `click to open`.
+ */
+export function fetchPreview(cand: Candidate, card: Card | null): Content {
+  if (card)
+    return { title: card.title, lines: [...card.meta.map((m) => prose(m, 'label')), ...card.body.map((b) => prose(b))], cite: card.cite ?? '', more: null, reread: false, cut: true }
+  const kind = cand.kind === 'option' ? cand.key.split('|')[0]! : cand.kind
+  return { title: cand.name, lines: [prose(kind, 'label'), prose('click to open', 'label')], cite: '', more: null, reread: false }
 }

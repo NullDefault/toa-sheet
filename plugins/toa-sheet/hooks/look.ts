@@ -23,6 +23,8 @@ export const TOKENS = {
   cyan: '#3fc8e0',
   violet: '#a07cff',
   faint: '#6a6a6a',
+  /** The hover preview's ground (T0093 Layer 3): the pane paints none, and the preview must cover the rows under it. */
+  card: '#2b2b3c',
 } as const
 
 /**

@@ -29,8 +29,8 @@
 // DM types, then a match's card (lookup.ts), each one more screen on the stack.
 
 import type { ButtonProps, Elements, RenderElement, RenderNode, TextProps } from 'claude-code'
-import { actionGroups, type ActionRow } from './actions.ts'
-import { detailBox, detailOf, greedy, type Content, type Detail } from './detail.ts'
+import { actionGroups, norm, type ActionRow } from './actions.ts'
+import { cardRows, detailAt, detailBox, detailOf, greedy, type Content, type Detail, type Preview } from './detail.ts'
 import { describe, live, onDeck, orderRows, statusText, type Fight, type Member, type Pack, type Row } from './fight.ts'
 import type { Candidate, Card, Heard, HeardItem } from './lookup.ts'
 import { coinsOf, type Entry, type Save } from './sheet.ts'
@@ -145,6 +145,8 @@ export interface PaneView {
   split: string | null
   /** The open detail box (T0093): the word it hangs from; else null. */
   detail: Detail | null
+  /** The hover preview (T0093 Layer 3), shown or pinned; else null. */
+  preview: Preview | null
 }
 
 /** The fight bar's buttons: [element key, hotkey, label]. The letters are shortcuts. */
@@ -332,22 +334,88 @@ function boxOf(v: PaneView, key: string): Content | null {
  * A word with a box (T0093), `w:<kind>:<subject>`; detail.ts says what its box
  * holds. On the terminal and the desktop it is the word Client (word.tsx), its
  * label underlined; elsewhere a plain Button. A press opens or closes its box;
- * while it is open the word is inverse. With no box it is the Text it replaces
- * (`plain` adds that Text's own props), never underlined.
+ * while it is open the word is inverse. A `w:c:` word opens its card instead.
+ * With no box it is the Text it replaces (`plain` adds that Text's own props),
+ * never underlined. `hover` (Layer 3, a word off the HUD, the header rows and
+ * /party): the Client also dwells, and its row hangs the preview (`hang`).
  */
-function word(el: Base, v: PaneView, make: Make, key: string, label: string, style: WordStyle = {}, plain: TextProps = {}): RenderNode {
-  if (!boxOf(v, key)) return text(el, label, { ...style, ...plain })
+function word(el: Base, v: PaneView, make: Make, key: string, label: string, style: WordStyle = {}, plain: TextProps = {}, hover = false): RenderNode {
+  if (!key.startsWith('w:c:') && !boxOf(v, key)) return text(el, label, { ...style, ...plain })
   const s = v.detail?.anchor === key ? { ...style, inverse: !style.inverse } : style
-  if (v.surface === 'terminal' || v.surface === 'desktop') return (el as Elements['terminal']).Client({ key, module: './word.tsx', props: { id: key, label, ...s } })
+  if (v.surface === 'terminal' || v.surface === 'desktop')
+    return (el as Elements['terminal']).Client({ key, module: './word.tsx', props: { id: key, label, ...(hover ? { hover } : {}), ...s } })
   return make({ key, label, plain: true, ...(s.dimColor ? { dimColor: true } : {}) })
 }
 
-/** The open box, as wide as the body, where `owns` claims its word; else nothing. */
+/** The open box, as wide as the body, where `owns` claims its word; else nothing. A pinned preview is drawn by `preview`. */
 function openBox(el: Base, v: PaneView, make: Make, owns: (anchor: string) => boolean): RenderNode[] {
-  const a = v.detail?.anchor
-  const c = a && owns(a) ? boxOf(v, a) : null
-  return c ? [detailBox(el, make, c, v.columns)] : []
+  const d = v.detail
+  const c = d && !d.above && owns(d.anchor) ? detailAt(d.path, v.rows, v.entry, v.now) : null
+  return c ? [detailBox(el, make, c, v.columns, (k, l, st) => word(el, v, make, k, l, st))] : []
 }
+
+/**
+ * The hover preview (Layer 3) where `owns` claims its word: an absolute Box
+ * its own height above the row, so it covers the rows above and never shoves
+ * them, as wide as the body, on the card's ground. A term's card on top, then
+ * while pinned `[ ‹ ]`, `[ × ]` and the box's buttons, then the word's card
+ * (card.tsx). Only where Clients draw: elsewhere a word stays a pin Button.
+ */
+function preview(el: Base, v: PaneView, make: Make, owns: (anchor: string) => boolean): RenderNode[] {
+  const p = v.preview
+  if (!p || !owns(p.anchor) || (v.surface !== 'terminal' && v.surface !== 'desktop')) return []
+  const card = (c: Content, depth: number) => {
+    const { rows, more } = cardRows(c, v.columns)
+    const node = (el as Elements['terminal']).Client({
+      key: `card-${depth}:${c.title}`,
+      module: './card.tsx',
+      width: v.columns,
+      height: rows.length,
+      props: { depth, width: v.columns, rows, bg: TOKENS.card },
+    })
+    return { node, h: rows.length, more }
+  }
+  const top = card(p.top, 1)
+  const nested = p.nested ? [card(p.nested, 2)] : []
+  // The pins row is padded as a card line is: a ground colour does not blank the cells behind it.
+  const ground = { backgroundColor: TOKENS.card }
+  const pins = p.pinned
+    ? [
+        row(
+          el,
+          [
+            ...[
+              ...(p.top.back ? [make({ key: 'detail-back', label: '‹' })] : []),
+              make({ key: 'detail-x', label: '×' }),
+              ...(top.more ? [make({ key: 'detail-more', label: 'more' })] : []),
+              ...(p.top.reread ? [make({ key: 'detail-reread', label: 're-read' })] : []),
+            ].flatMap((b) => [text(el, ' ', ground), b]),
+            el.Box({ flexGrow: 1, width: 0, height: 1, overflow: 'hidden', children: [text(el, ' '.repeat(v.columns), { ...ground, wrap: 'truncate-end' })] }),
+          ],
+          0,
+        ),
+      ]
+    : []
+  const h = top.h + nested.reduce((n, c) => n + c.h, 0) + pins.length
+  return [
+    el.Box({
+      position: 'absolute',
+      top: -h,
+      left: 0,
+      width: v.columns,
+      flexDirection: 'column',
+      backgroundColor: TOKENS.card,
+      children: [...nested.map((c) => c.node), ...pins, top.node],
+    }),
+  ]
+}
+
+/** A row a preview hangs above: always the one Box, so the row's words keep their place in the tree. */
+const hang = (el: Base, v: PaneView, make: Make, node: RenderNode, owns: (anchor: string) => boolean) => col(el, [node, ...preview(el, v, make, owns)])
+
+/** A list line: `- `, its word, then the rest wrapping beside it. */
+const wordLine = (el: Base, w: RenderNode, rest: string) =>
+  el.Box({ flexDirection: 'row', children: [el.Box({ flexShrink: 0, flexDirection: 'row', children: [text(el, '- '), w] }), el.Box({ flexShrink: 1, children: [text(el, rest, { wrap: 'wrap' })] })] })
 
 /**
  * The top line of every screen: `[ ‹ back ]` while there is a screen to go
@@ -403,7 +471,7 @@ function actionsTab(el: Base, e: Entry, v: PaneView, make: Make): RenderNode[] {
             [
               ...(r.missing
                 ? [text(el, r.name + (r.dm ? ' ★' : ''), { bold: true, wrap: 'wrap' })]
-                : [word(el, v, make, 'w:act:' + r.key, r.name, { bold: true }, { wrap: 'wrap' }), ...(r.dm ? [text(el, '★', { bold: true })] : [])]),
+                : [word(el, v, make, 'w:act:' + r.key, r.name, { bold: true }, { wrap: 'wrap' }, true), ...(r.dm ? [text(el, '★', { bold: true })] : [])]),
               ...(r.always ? [dim(el, 'always')] : []),
               ...r.badges.map((b) => badge(r, i, b)),
             ],
@@ -430,6 +498,7 @@ function actionsTab(el: Base, e: Entry, v: PaneView, make: Make): RenderNode[] {
         ],
       }),
       ...openBox(el, v, make, (a) => a === 'w:act:' + r.key),
+      ...preview(el, v, make, (a) => a === 'w:act:' + r.key),
     ])
   const out = groups.map((g) => {
     const s = g.slots
@@ -450,22 +519,27 @@ function skillsTab(el: Base, e: Entry, v: PaneView, make: Make): RenderNode[] {
   const pend = e.derivedPending
   const checks = wrapRow(el, [dim(el, 'CHECKS'), ...ABILITIES.map((a) => stat(el, a.toUpperCase(), signed(d.modifiers?.[a]), pend))])
   const skillProf = new Map<string, boolean>((s.proficiencies?.skills ?? []).map((k: any) => [String(k.name).toLowerCase(), !!k.expertise]))
-  const skills = el.Box({
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    children: Object.entries((d.skills ?? {}) as Record<string, number>)
-      .sort(([a], [b]) => a.localeCompare(b))
-      .map(([name, n]) => {
-        const p = skillProf.get(name.toLowerCase())
-        return el.Box({
+  const cells = Object.entries((d.skills ?? {}) as Record<string, number>)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([name, n]): [string, RenderNode] => {
+      const p = skillProf.get(name.toLowerCase())
+      return [
+        name,
+        el.Box({
           width: '50%',
           flexDirection: 'row',
           justifyContent: 'space-between',
           paddingRight: 2,
-          children: [row(el, [word(el, v, make, 'w:skill:' + name, name, p === undefined ? { dimColor: true } : {}), ...(p === undefined ? [] : [mark(el, p ? '◆' : '●')])]), value(el, signed(n), pend)],
-        })
-      }),
-  })
+          children: [row(el, [word(el, v, make, 'w:skill:' + name, name, p === undefined ? { dimColor: true } : {}, {}, true), ...(p === undefined ? [] : [mark(el, p ? '◆' : '●')])]), value(el, signed(n), pend)],
+        }),
+      ]
+    })
+  // Two to a row, each row hanging its own words' preview.
+  const pairs = Array.from({ length: Math.ceil(cells.length / 2) }, (_, i) => cells.slice(2 * i, 2 * i + 2))
+  const skills = col(
+    el,
+    pairs.map((pr) => hang(el, v, make, el.Box({ flexDirection: 'row', children: pr.map(([, c]) => c) }), (a) => pr.some(([name]) => a === 'w:skill:' + name))),
+  )
   const hd = Object.entries((d.hit_dice ?? {}) as Record<string, number>).map(([die, n]) => `${die} ${Math.max(0, n - (s.hit_dice_spent?.[die] ?? 0))}/${n}`)
   return [
     checks,
@@ -478,10 +552,34 @@ function skillsTab(el: Base, e: Entry, v: PaneView, make: Make): RenderNode[] {
   ]
 }
 
-function featuresTab(el: Base, e: Entry): RenderNode[] {
+/**
+ * A feature's word, by what it comes from: a feat, the sheet's species or
+ * background (the whole option: they take no feature), or a class or subclass
+ * on the sheet (the one feature); `class` names the sheet's class when it has
+ * one only. Plain where `from` names none of these.
+ */
+function featureKey(s: any, f: any): string | null {
+  const from = norm(String(f.from ?? ''))
+  if (from === 'feat') return `w:c:option:feat|${f.name}|`
+  for (const k of ['species', 'background'] as const) if (s[k]?.name && (from === k || from === norm(s[k].name))) return `w:c:option:${k}|${s[k].name}|${f.name}`
+  if (from === 'class' && s.classes?.length === 1 && s.classes[0].name) return `w:c:option:class|${s.classes[0].name}|${f.name}`
+  for (const c of s.classes ?? []) {
+    if (c.subclass?.name && from === norm(c.subclass.name)) return `w:c:option:subclass|${c.subclass.name}|${f.name}`
+    if (c.name && from === norm(c.name)) return `w:c:option:class|${c.name}|${f.name}`
+  }
+  return null
+}
+
+function featuresTab(el: Base, e: Entry, v: PaneView, make: Make): RenderNode[] {
   const s = e.sheet
-  const feat = (f: any) => `- **${f.name}**` + (f.from ? ` (${f.from})` : '') + (f.choice ? `: ${f.choice}` : '') + (f.note ? ` — ${f.note}` : '') + dmMark(e, f.name)
-  const features = [...(s.feats ?? []).map((f: any) => feat({ ...f, from: f.from ?? 'feat' })), ...(s.features ?? []).map(feat)]
+  // Each word's key ends in its row, so a feat taken twice draws two words.
+  const feat = (f: any, i: number) => {
+    const key = featureKey(s, f)
+    const name = key ? word(el, v, make, `${key}|${i}`, f.name, { bold: true }, {}, true) : text(el, f.name, { bold: true })
+    const line = wordLine(el, name, (f.from ? ` (${f.from})` : '') + (f.choice ? `: ${f.choice}` : '') + (f.note ? ` — ${f.note}` : '') + dmMark(e, f.name))
+    return hang(el, v, make, line, (a) => a === `${key}|${i}`)
+  }
+  const features = [...(s.feats ?? []).map((f: any) => ({ ...f, from: f.from ?? 'feat' })), ...(s.features ?? [])].map(feat)
   const subclasses = (s.classes ?? []).filter((c: any) => c.subclass?.name).map((c: any) => `- **${c.subclass.name}** (${c.name} ${c.level})`)
   const pr = s.proficiencies ?? {}
   const prof = (
@@ -496,20 +594,24 @@ function featuresTab(el: Base, e: Entry): RenderNode[] {
     .map(([k, v]) => `- **${k}:** ${(v as string[]).join(', ')}`)
   return [
     ...(subclasses.length ? [section(el, heading(el, 'Subclasses'), [md(el, subclasses)])] : []),
-    section(el, heading(el, 'Features'), [md(el, features.length ? features : ['_None._'])]),
+    section(el, heading(el, 'Features'), features.length ? features : [md(el, ['_None._'])]),
     ...(prof.length ? [section(el, heading(el, 'Proficiencies'), [md(el, prof)])] : []),
   ]
 }
 
-function gearTab(el: Base, e: Entry): RenderNode[] {
+function gearTab(el: Base, e: Entry, v: PaneView, make: Make): RenderNode[] {
   const s = e.sheet
-  const items = (s.inventory ?? []).map(
-    (i: any) => `- ${i.name}` + (i.quantity !== 1 ? ` ×${i.quantity}` : '') + (i.attuned ? ' (attuned)' : '') + (i.note ? ` — ${i.note}` : ''),
-  )
+  // Each item's name as written: the server answers only a name it prints.
+  // The key ends in the row, so an item listed twice draws two words.
+  const items = (s.inventory ?? []).map((i: any, n: number) => {
+    const key = `w:c:option:item|${i.name}||${n}`
+    const line = wordLine(el, word(el, v, make, key, i.name, {}, {}, true), (i.quantity !== 1 ? ` ×${i.quantity}` : '') + (i.attuned ? ' (attuned)' : '') + (i.note ? ` — ${i.note}` : ''))
+    return hang(el, v, make, line, (a) => a === key)
+  })
   const coins = Object.entries((s.currency ?? {}) as Record<string, number>)
     .filter(([, n]) => n > 0)
     .map(([k, n]) => `${n} ${k}`)
-  return [section(el, heading(el, 'Inventory'), [md(el, items.length ? items : ['_Nothing written._'])]), text(el, `Money  ${coins.join(', ') || 'none'}`, { bold: true })]
+  return [section(el, heading(el, 'Inventory'), items.length ? items : [md(el, ['_Nothing written._'])]), text(el, `Money  ${coins.join(', ') || 'none'}`, { bold: true })]
 }
 
 /** Notes: the DM's rules first, then who the character is, with unresolved names flagged beside them. */
@@ -537,9 +639,9 @@ function tabBody(el: Base, e: Entry, tab: TabId, v: PaneView, make: Make): Rende
     case 'skills':
       return skillsTab(el, e, v, make)
     case 'features':
-      return featuresTab(el, e)
+      return featuresTab(el, e, v, make)
     case 'gear':
-      return gearTab(el, e)
+      return gearTab(el, e, v, make)
     case 'notes':
       return notesTab(el, e)
     default:
@@ -875,11 +977,17 @@ export function paneTree(el: Els, v: PaneView): RenderElement {
     ...(off ? [text(el, off, { color: TOKENS.faint, wrap: 'wrap' })] : []),
     ...(truth !== 'confirmed'
       ? [
-          row(el, [
-            word(el, v, make, 'w:seen:' + e.id, `seen ${sameDay(e.readAt, v.now) ? clock(e.readAt) : day(e.readAt)}`, { color: TOKENS.faint }),
-            text(el, '·', { color: TOKENS.faint }),
-            make({ key: 'reread', label: 're-read', hotkey: 'e' }),
-          ]),
+          hang(
+            el,
+            v,
+            make,
+            row(el, [
+              word(el, v, make, 'w:seen:' + e.id, `seen ${sameDay(e.readAt, v.now) ? clock(e.readAt) : day(e.readAt)}`, { color: TOKENS.faint }, {}, true),
+              text(el, '·', { color: TOKENS.faint }),
+              make({ key: 'reread', label: 're-read', hotkey: 'e' }),
+            ]),
+            (a) => a === 'w:seen:' + e.id,
+          ),
         ]
       : []),
     ...(c && c.warnings > 0 && c.version === e.version ? [text(el, checkText(c), { color: TOKENS.faint, wrap: 'wrap' })] : []),

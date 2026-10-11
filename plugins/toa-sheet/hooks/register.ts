@@ -34,7 +34,8 @@
 //
 // `[ look up ]` (T0085 stage 1) pushes the look's field, and a match its card:
 // drawn at once from the facts, then filled from the rules server's
-// `spell_get`, `monster_get` or `condition_search`, called on the press. `[ ask
+// `spell_get`, `monster_get`, `condition_search` or `character_option_get`
+// (a feature, feat, species or item), called on the press. `[ ask
 // Claude ]` submits the subject as a prompt of the person's own session.
 //
 // Live listening (T0085 stage 2): once `/party` opens in a session, a 1.5 s
@@ -48,7 +49,7 @@
 import type { EngineInterface, MatchedHook, On, RenderElement, Timer, ToolCallArgs } from 'claude-code'
 import { actionGroups } from './actions.ts'
 import { fold, lastPack, live, nextPack, parsePacks, sessionPacks, summary, undoTarget, type Event, type Fight, type Op, type Pack } from './fight.ts'
-import { detailOf, pressWord, type Detail } from './detail.ts'
+import { detailAt, fetchPreview, pressWord, wordCard, type Content, type Detail, type Preview } from './detail.ts'
 import { FLASH_MS } from './look.ts'
 import { askText, asHeard, candidates, cardOf, factsRow, HEARD_PATH, matches, norm, type Candidate, type Heard } from './lookup.ts'
 import { CONNECTOR, VAULT, receipt } from './receipt.ts'
@@ -126,10 +127,20 @@ type Look = { pane: 'Party' | 'Sheet'; text: string; cand: Candidate | null; loa
 let look: Look | null = null
 /** The open detail box (T0093): one at a time; a screen or tab change closes it. */
 let detail: Detail | null = null
+// The hover preview (T0093 Layer 3), never stored: the word word.tsx's dwell
+// named, the term card.tsx's dwell named inside its card, the word and the
+// cards (by depth) the pointer is on, and the grace that closes what it left.
+let hover: string | null = null
+let nested: string | null = null
+let onWord: string | null = null
+const onCard = new Set<number>()
+let grace: Timer | null = null
+const GRACE_MS = 150
 // The rules server's answers, by kind and name, for the module's life: a second look draws at once and calls nothing.
 const rules = new Map<string, unknown>()
-const RULES_TOOL = /^mcp__(.+)__(spell_get|monster_get|condition_search)$/
-const TOOL_OF = { spell: 'spell_get', monster: 'monster_get', condition: 'condition_search' } as const
+const RULES_TOOL = /^mcp__(.+)__(spell_get|monster_get|condition_search|character_option_get)$/
+// A glossary card is drawn from GLOSSARY and calls nothing.
+const TOOL_OF: Partial<Record<Candidate['kind'], string>> = { spell: 'spell_get', monster: 'monster_get', condition: 'condition_search', option: 'character_option_get' }
 // The heard file as last read, while fresh, and the clock that reads it: started by
 // the session's first `/party`, so a player's pane never polls. Never stored.
 let heard: Heard | null = null
@@ -251,14 +262,14 @@ async function back($: EngineInterface) {
 /** Show `s`: pushed, or, when it is already on the stack, the stack cut back to it. */
 function pushScreen(s: Screen) {
   leave()
-  detail = null
+  shut()
   const at = screens.indexOf(s)
   screens = at >= 0 ? screens.slice(0, at + 1) : [...screens, s]
 }
 
 function popScreen() {
   leave()
-  detail = null
+  shut()
   if (screens.length > 1) screens = screens.slice(0, -1)
 }
 
@@ -535,7 +546,7 @@ const monsterNames = () => [
   ...(packs ?? []).flatMap((p) => p.rows.map((r) => r.name)),
 ]
 const lookMatches = () => (look ? matches(look.text, candidates(monsterNames())) : [])
-const cacheKey = (c: Candidate) => c.kind + '|' + norm(c.name)
+const cacheKey = (c: Candidate) => c.kind + '|' + (c.kind === 'option' ? c.key : norm(c.name))
 
 /** The look as drawn, while its screens show. */
 function lookView(): LookView | null {
@@ -565,7 +576,7 @@ async function openCard($: EngineInterface, cand: Candidate, said: string, pane:
   $.ui.invalidate('ui.render')
   await openPane($)
   const k = cacheKey(cand)
-  if (rules.has(k) || look?.cand !== cand) return
+  if (cand.kind === 'glossary' || rules.has(k) || look?.cand !== cand) return
   look = { ...look, loading: true }
   $.ui.invalidate('ui.render')
   const got = await fetchRules($, cand, said)
@@ -584,10 +595,16 @@ async function fetchRules($: EngineInterface, cand: Candidate, said: string): Pr
   try {
     const names = (await $.tool.list()).map((t) => t.name)
     const want = TOOL_OF[cand.kind]
+    if (!want) return { error: 'nothing to fetch for ' + cand.name }
     const known = [...sheets.values()].map((e) => `mcp__${e.server}__${want}`).find((n) => names.includes(n))
     const tool = known ?? names.find((n) => RULES_TOOL.exec(n)?.[2] === want)
     if (!tool) return { error: 'no rules tool in this session: add the rules connector' }
-    const args = cand.kind === 'condition' ? { tool, query: cand.name, limit: 5, consent: said } : { tool, name: cand.name, consent: said }
+    let args: object = { tool, name: cand.name, consent: said }
+    if (cand.kind === 'condition') args = { tool, query: cand.name, limit: 5, consent: said }
+    if (cand.kind === 'option') {
+      const [kind, name, feature] = cand.key.split('|')
+      args = { tool, kind, name, ...(feature ? { feature } : {}), consent: said }
+    }
     // The name is found at run time, so it is no literal the declarations know.
     const r = await $.tool.call(args as ToolCallArgs)
     if ('deny' in r) return { error: firstLine(r.deny) }
@@ -603,6 +620,76 @@ async function fetchRules($: EngineInterface, cand: Candidate, said: string): Pr
 }
 
 /**
+ * A word's press, from word.tsx's post or the fallback Button: a `w:c:` word
+ * opens its card (fetched, as a look's match); any other opens, nests or
+ * closes its box.
+ */
+async function pressed($: EngineInterface, key: string) {
+  const cand = wordCard(key)
+  const pane = top() === 'sheet' ? 'Sheet' : 'Party'
+  if (cand) return openCard($, cand, consent('look up: ' + cand.name, pane), pane)
+  detail = pressWord(detail, key)
+  $.ui.invalidate('ui.render')
+}
+
+/** The box and the preview close: a screen or tab change, Esc, `[ × ]`. */
+function shut() {
+  detail = hover = nested = onWord = null
+  onCard.clear()
+  grace?.cancel()
+  grace = null
+}
+
+/**
+ * A click on the preview (or its word): it locks where it stands, a pinned box
+ * drawn above the word; at depth 2 the nested card's term is pinned on its path.
+ */
+function pin(depth: number) {
+  if (!detail?.above && hover) detail = { anchor: hover, path: [hover], above: true }
+  if (depth === 2 && detail?.above && nested) detail = pressWord(detail, nested)
+  hover = nested = null
+  onCard.clear()
+  grace?.cancel()
+  grace = null
+}
+
+/** The grace after the pointer leaves a word or card: what it has not come back to closes. */
+function later($: EngineInterface) {
+  grace?.cancel()
+  grace = null
+  if (!hover && !nested) return
+  grace = $.clock.after(GRACE_MS, () => {
+    grace = null
+    const was = [hover, nested]
+    if (!onCard.has(2)) nested = null
+    if (onWord !== hover && !onCard.size) hover = nested = null
+    if (hover === was[0] && nested === was[1]) return
+    $.ui.invalidate('ui.render')
+    void syncEsc($)
+  })
+}
+
+/** A path's last card as a preview shows it: a fetch word's cached card (hover never fetches), else its box, untitled by its path. */
+function glance(path: string[], rows: Entry[], entry: Entry | null, now: number): Content | null {
+  const k = path.at(-1)!
+  const cand = wordCard(k)
+  if (cand) return fetchPreview(cand, rules.has(cacheKey(cand)) ? cardOf(cand, rules.get(cacheKey(cand)), factsRow(cand)) : null)
+  const c = detailAt(path, rows, entry, now)
+  return c && { ...c, title: c.title.split(' › ').at(-1)!, back: false }
+}
+
+/** The preview as drawn: the pinned box or the hovered word's card, and the term's card dwelt on inside it. */
+function previewView(rows: Entry[], entry: Entry | null, now: number): Preview | null {
+  const pinned = !!detail?.above
+  const base = pinned ? detail!.path : hover ? [hover] : null
+  if (!base) return null
+  const top = pinned ? detailAt(base, rows, entry, now) : glance(base, rows, entry, now)
+  if (!top) return null
+  const to = nested && (nested.startsWith('w:n:') ? 'w:' + nested.slice('w:n:'.length) : nested)
+  return { anchor: pinned ? detail!.anchor : hover!, top, nested: to ? glance([...base, to], rows, entry, now) : null, pinned }
+}
+
+/**
  * `[ ask Claude ]`: the subject (the card's title and cite, or the field's
  * text) as a prompt of this session, fired and not awaited (it runs once the
  * session is idle). The look closes and the note says so at once.
@@ -615,7 +702,7 @@ async function askClaude($: EngineInterface) {
   void $.prompt.submit({ text: askText({ subject, pane: look.pane, session, tail: look.pane === 'Party' ? heard?.tail : null }) }).catch(() => {})
   const at = screens.findIndex((s) => s === 'look' || s === 'card')
   leave()
-  detail = null
+  shut()
   screens = screens.slice(0, Math.max(1, at))
   look = null
   await openPane($)
@@ -905,7 +992,7 @@ async function remember($: EngineInterface, entry: Entry) {
     // Esc closes it (or steps back to Party), as `/sheet`'s does: a player who never typed `/sheet` needs a way out.
     screens = sheetStack()
     leave()
-    detail = null
+    shut()
     const placed = await openPane($)
     if (placed && placed.isPlaced) {
       paneOpen = true
@@ -1133,7 +1220,7 @@ export function register(on: On) {
     const words = String(e.args ?? '').trim().split(/\s+/).filter(Boolean)
     const named = words.map(tabOf).find((t) => t !== null)
     if (named) tab = named
-    detail = null
+    shut()
     const query = words.filter((w) => tabOf(w) === null).join(' ')
     if (query) {
       const hit = matchEntry([...sheets.values()], query)
@@ -1164,7 +1251,7 @@ export function register(on: On) {
     await readPackets($)
     screens = ['party']
     leave()
-    detail = null
+    shut()
     dismissed = false
     heardPoll ??= $.clock.every(1500, () => void readHeard($))
     await openPane($, true)
@@ -1187,8 +1274,8 @@ export function register(on: On) {
         await cancel($)
         return { value: undefined }
       }
-      if (detail) {
-        detail = null
+      if (detail || hover) {
+        shut()
         $.ui.invalidate('ui.render')
         await openPane($, wantsEsc())
         return { value: undefined }
@@ -1215,11 +1302,12 @@ export function register(on: On) {
     const now = await $.clock.now()
     const flashing = flash && flash.id === focus && now < flash.until ? flash.paths : null
     const entry = focused()
+    const rows = rosterRows([...sheets.values()])
     return paneTree(el, {
       screen: top(),
       canBack: screens.length > 1,
       entry,
-      rows: rosterRows([...sheets.values()]),
+      rows,
       log: session ? logs.get(session) ?? null : null,
       logOpen,
       session,
@@ -1246,14 +1334,60 @@ export function register(on: On) {
       heard,
       split,
       detail,
+      preview: previewView(rows, entry, now),
     })
   })
 
-  // A word's press (word.tsx posts `{press: key}`): its box opens, or closes when it is the open one.
+  // A word's posts (word.tsx): `press` opens, nests or closes its box, opens its
+  // card, or pins its showing preview; `enter`, `hover` (the dwell) and `unhover`
+  // run the preview. A card's (card.tsx): `card` enter and leave hold it open,
+  // `hoverTerm` nests a term's card, `pressTerm` and `pressCard` pin it.
   on('ui.message', async ($, e, next) => {
-    const press = (e.data as { press?: unknown } | null)?.press
-    if (e.requestId !== PANE || typeof press !== 'string' || !press.startsWith('w:') || press !== e.element) return next(e)
-    detail = pressWord(detail, press)
+    if (e.requestId !== PANE || !e.data || typeof e.data !== 'object') return next(e)
+    const d = e.data as Record<string, unknown>
+    const isWord = (k: unknown): k is string => typeof k === 'string' && k.startsWith('w:')
+    // Only a change to what shows redraws: an enter or a card's enter and leave change nothing.
+    const was = [hover, nested, detail]
+    let press = false
+    const pressing = (key: string) => ((press = true), pressed($, key))
+    if (e.element.startsWith('card-')) {
+      const depth = d.depth
+      if (depth !== 1 && depth !== 2) return next(e)
+      if (d.card === 'enter') onCard.add(depth)
+      else if (d.card === 'leave') {
+        onCard.delete(depth)
+        later($)
+      } else if (isWord(d.hoverTerm) && depth === 1) nested = d.hoverTerm
+      else if (isWord(d.pressTerm)) {
+        pin(depth)
+        await pressing(d.pressTerm)
+      } else if (d.pressCard === depth) {
+        if (depth === 2 && nested?.startsWith('w:c:')) await pressing(nested)
+        else if (depth === 1 && hover?.startsWith('w:c:')) await pressing(hover)
+        else pin(depth)
+      } else return next(e)
+    } else {
+      const [kind, key] = Object.entries(d)[0] ?? []
+      if (!isWord(key) || key !== e.element) return next(e)
+      if (kind === 'press') {
+        // A fetch word's preview never pins: its click fetches, as the Button's does.
+        if (hover === key && !key.startsWith('w:c:')) pin(1)
+        else {
+          hover = nested = null
+          await pressing(key)
+        }
+      } else if (kind === 'enter') onWord = key
+      else if (kind === 'hover') {
+        // A pinned box holds the preview; a word whose inline box is open shows no preview.
+        if (detail?.above || detail?.anchor === key) return {}
+        hover = key
+        nested = null
+      } else if (kind === 'unhover') {
+        if (onWord === key) onWord = null
+        later($)
+      } else return next(e)
+    }
+    if (!press && [hover, nested, detail].every((x, i) => x === was[i])) return {}
     $.ui.invalidate('ui.render')
     await syncEsc($)
     return {}
@@ -1372,12 +1506,15 @@ export function register(on: On) {
         $.ui.invalidate('ui.render')
         if (split !== null) await focusOn($, 'split-amount')
       } else if (id.startsWith('w:')) {
-        // A word where no Client draws it: a plain Button that opens and closes its box.
-        detail = pressWord(detail, id)
+        // A word where no Client draws it: a plain Button, pressed as the Client's post is.
+        await pressed($, id)
+        return { element: id }
+      } else if (id === 'detail-back') {
+        if (detail && detail.path.length > 1) detail = { ...detail, path: detail.path.slice(0, -1) }
         $.ui.invalidate('ui.render')
         return { element: id }
       } else if (id === 'detail-x') {
-        detail = null
+        shut()
         $.ui.invalidate('ui.render')
         return { element: id }
       } else if (id === 'detail-reread') {
@@ -1385,14 +1522,14 @@ export function register(on: On) {
         return { element: id }
       } else if (id === 'detail-more') {
         const pane = top() === 'sheet' ? 'Sheet' : 'Party'
-        const c = detail && detailOf(detail.anchor, rosterRows([...sheets.values()]), focused(), await $.clock.now())
+        const c = detail && detailAt(detail.path, rosterRows([...sheets.values()]), focused(), await $.clock.now())
         if (c?.more) await openCard($, c.more, consent('look up: ' + c.more.name, pane), pane)
         return { element: id }
       }
       const hit = TABS.find((t) => tabKey(t.id) === e.element)?.id ?? (e.element === RULES_KEY ? 'notes' : null)
       if (hit && hit !== tab) {
         tab = hit
-        detail = null
+        shut()
         $.ui.invalidate('ui.render')
       }
       return await next(e)

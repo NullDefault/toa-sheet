@@ -4,12 +4,18 @@
 // at once and from the rules server's answer once a press fetched it. Pure:
 // no mods API (register.ts calls the tools, view.ts draws).
 
-import { norm } from './actions.ts'
+import { norm, weaponFact } from './actions.ts'
 import { SPELLS, type SpellRow } from './facts.ts'
+import { GLOSSARY } from './glossary.ts'
 
 export { norm }
 
-export type Candidate = { name: string; kind: 'spell' | 'condition' | 'monster'; key: string }
+/**
+ * A card's subject. `glossary` is drawn from `GLOSSARY` with no fetch; `option`
+ * (a feature, feat, species or item, from the sheet's tabs or a glossary link)
+ * is fetched by `character_option_get`, its key `kind|name|feature`.
+ */
+export type Candidate = { name: string; kind: 'spell' | 'condition' | 'monster' | 'glossary' | 'option'; key: string }
 
 export type Card = { title: string; meta: string[]; body: string[]; cite: string | null }
 
@@ -55,7 +61,7 @@ export function candidates(monsters: string[]): Candidate[] {
   return [...mons, ...SPELL_CANDS, ...CONDITION_CANDS]
 }
 
-const KIND_ORDER = { monster: 0, spell: 1, condition: 2 } as const
+const KIND_ORDER = { monster: 0, spell: 1, condition: 2, glossary: 3, option: 4 } as const
 
 /** 0 exact, 1 whole-name prefix, 2 word prefix, 3 substring; -1 no match. */
 function tier(q: string, name: string): number {
@@ -192,6 +198,38 @@ function monsterMeta(p: Record<string, any>): string[] {
   ]
 }
 
+const ARMOR: Record<string, (ac: unknown) => string> = {
+  LA: (ac) => `Light armor, AC ${ac} + Dex`,
+  MA: (ac) => `Medium armor, AC ${ac} + Dex (max 2)`,
+  HA: (ac) => `Heavy armor, AC ${ac}`,
+  S: (ac) => `Shield, AC +${ac}`,
+}
+
+const coins = (cp: number) => (cp % 100 === 0 ? `${cp / 100} gp` : cp % 10 === 0 ? `${cp / 10} sp` : `${cp} cp`)
+
+/** A base item's answer as meta lines: a weapon's facts row, or armor's AC and needs; then weight and cost. */
+function itemMeta(p: Record<string, any>): string[] {
+  const c = p.citation ?? {}
+  const meta: string[] = []
+  const w = p.weapon && typeof c.name === 'string' ? weaponFact(c.name, c.source, c.edition) : null
+  if (w) {
+    const [category, kind, dice, type, versatile, props, range, mastery] = w.row
+    meta.push(`${category.charAt(0).toUpperCase() + category.slice(1)} ${kind} weapon`, `${dice} ${type}` + (versatile ? ` (${versatile} two-handed)` : ''))
+    if (props) meta.push(props.split(',').join(', '))
+    if (range) meta.push(`Range ${range} ft`)
+    if (mastery) meta.push(`Mastery: ${mastery}`)
+  }
+  const armor = ARMOR[String(p.type ?? '').split('|')[0]!]
+  if (armor) {
+    meta.push(armor(p.ac))
+    if (p.strength) meta.push(`Str ${p.strength}`)
+    if (p.stealth) meta.push('Stealth Disadvantage')
+  }
+  if (typeof p.weight === 'number') meta.push(`${p.weight} lb`)
+  if (typeof p.value === 'number') meta.push(coins(p.value))
+  return meta
+}
+
 /** A monster's traits, then actions, bonus actions and reactions, each `Name. text`. */
 const monsterBody = (p: Record<string, any>) =>
   ['trait', 'action', 'bonus', 'reaction'].flatMap((k) =>
@@ -203,6 +241,11 @@ export const factsRow = (cand: Candidate): SpellRow | null => (cand.kind === 'sp
 
 /** The card: the facts row's meta at once (spells), then the server's answer: its name, body and citation. */
 export function cardOf(cand: Candidate, payload: unknown, row: SpellRow | null): Card {
+  if (cand.kind === 'glossary') {
+    const g = GLOSSARY[cand.key]
+    const body = g ? g[1].replace(/⟦[^|⟧]*\|([^⟧]*)⟧/g, '$1').split('\n') : []
+    return { title: g?.[0] ?? cand.name, meta: [], body, cite: g ? `${g[2]} p${g[3]}, 2024` : null }
+  }
   const p = payload && typeof payload === 'object' ? (payload as Record<string, any>) : null
   const c = p?.citation
   const cite = c && typeof c === 'object' && c.source ? `${c.source} p${c.page ?? '?'}, ${c.edition ?? '?'}` : null
@@ -211,6 +254,21 @@ export function cardOf(cand: Candidate, payload: unknown, row: SpellRow | null):
     return { title, meta: row ? spellMeta(row) : [], body: p ? [...flatten(p.entries), ...flatten(p.entriesHigherLevel)] : [], cite }
   }
   if (cand.kind === 'monster') return { title, meta: p ? monsterMeta(p) : [], body: p ? monsterBody(p) : [], cite }
+  if (cand.kind === 'option') {
+    // A class or subclass feature's answer carries `feature.text`; a species', `traits`
+    // (the pressed one, else all of them); an item's, its facts as meta; the rest, `entries`.
+    const text = p?.feature?.text
+    const name = p?.feature?.name ?? c?.name
+    const named = typeof name === 'string' ? name : cand.name
+    const traits = Array.isArray(p?.traits) ? p.traits.filter((t: any) => typeof t?.name === 'string' && typeof t?.text === 'string') : []
+    if (cand.key.startsWith('species|') && traits.length) {
+      const one = traits.find((t: any) => norm(t.name) === norm(cand.name))
+      if (one) return { title: one.name, meta: [], body: one.text.split(/\n+/).filter(Boolean), cite }
+      return { title: named, meta: [], body: traits.map((t: any) => `${t.name}. ${t.text}`), cite }
+    }
+    const meta = p && cand.key.startsWith('item|') ? itemMeta(p) : []
+    return { title: named, meta, body: typeof text === 'string' ? text.split(/\n+/).filter(Boolean) : p ? flatten(p.entries) : [], cite }
+  }
   return { title, meta: [], body: p ? flatten(p.entries) : [], cite }
 }
 
