@@ -205,6 +205,9 @@ const OUTSIDE_DERIVED = [
   /^\/notes$/,
   /^\/details(\/|$)/,
   /^\/requests(\/|$)/,
+  // A companion's HP, uses and status: the pane reads them off the sheet, not derived.
+  /^\/companions\/\d+\/(hp|status|notes)(\/|$)/,
+  /^\/companions\/\d+\/resources\/\d+\/used$/,
 ]
 
 export const touchesDerived = (path: string) => !OUTSIDE_DERIVED.some((re) => re.test(path))

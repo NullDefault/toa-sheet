@@ -34,7 +34,7 @@ import { cardRows, detailAt, detailBox, detailOf, greedy, type Content, type Det
 import { describe, live, onDeck, orderRows, statusText, type Fight, type Member, type Pack, type Row } from './fight.ts'
 import type { Candidate, Card, Heard, HeardItem } from './lookup.ts'
 import { coinsOf, type Entry, type Save } from './sheet.ts'
-import { bandSegments, gaugeRuns, hpSegments, hpState, noneSegments, pipRuns, RECEIPT_INDENT, rule, TOKENS, type HpState, type Run, type Segment, type Tone } from './look.ts'
+import { bandSegments, FAINT_TEXT, gaugeRuns, hpSegments, hpState, noneSegments, pipRuns, RECEIPT_INDENT, rule, TOKENS, type HpState, type Run, type Segment, type Tone } from './look.ts'
 import { badgeSvg, cellsSvg, hpSvg, pipsSvg, readoutSvg, type Art } from './pixel.ts'
 import type { Receipt } from './receipt.ts'
 import type { TableLog } from './table.ts'
@@ -54,7 +54,8 @@ export const TABS = [
   { id: 'actions', label: 'act', words: ['actions', 'action', 'act', 'spells', 'attacks'] },
   { id: 'skills', label: 'skills', words: ['skills', 'skill', 'saves', 'save', 'checks'] },
   { id: 'features', label: 'feats', words: ['features', 'feats', 'traits'] },
-  { id: 'gear', label: 'gear', words: ['gear', 'inventory', 'items', 'money'] },
+  { id: 'gear', label: 'gear', words: ['gear', 'inventory', 'items', 'money', 'equipment', 'equipped'] },
+  { id: 'companions', label: 'pets', words: ['companions', 'companion', 'summons', 'summon', 'pets', 'pet', 'creatures', 'familiar'] },
   { id: 'notes', label: 'notes', words: ['notes', 'rules', 'character', 'details'] },
 ] as const
 export type TabId = (typeof TABS)[number]['id']
@@ -77,7 +78,8 @@ export type Reread = { at: number; sheets: number; listed: number } | { refused:
 /** The number field's question: which number, for which row and member, and its text so far. */
 export type Ask = { kind: 'damage' | 'heal' | 'init'; row: string; member: number; text: string }
 /** The sheet view's number field: damage, healing or coins for the focused sheet, and its text so far. */
-export type Tap = { kind: 'damage' | 'heal' | 'coins'; text: string }
+/** `companion`: the index of the companion it hits or heals (the pets tab), with its name for the field. */
+export type Tap = { kind: 'damage' | 'heal' | 'coins'; text: string; companion?: { index: number; name: string; use?: { index: number; label: string } } }
 /** The add form's five fields, as the DM has filled them so far. */
 export type Adding = { name: string; count: string; hp: string; ac: string; init: string }
 
@@ -371,7 +373,7 @@ function preview(el: Base, v: PaneView, make: Make, owns: (anchor: string) => bo
       module: './card.tsx',
       width: v.columns,
       height: rows.length,
-      props: { depth, width: v.columns, rows, bg: TOKENS.card },
+      props: { depth, width: v.columns, rows, bg: TOKENS.card, ink: TOKENS.cardInk, dim: TOKENS.cardDim },
     })
     return { node, h: rows.length, more }
   }
@@ -385,10 +387,10 @@ function preview(el: Base, v: PaneView, make: Make, owns: (anchor: string) => bo
           el,
           [
             ...[
-              ...(p.top.back ? [make({ key: 'detail-back', label: '‹' })] : []),
-              make({ key: 'detail-x', label: '×' }),
-              ...(top.more ? [make({ key: 'detail-more', label: 'more' })] : []),
-              ...(p.top.reread ? [make({ key: 'detail-reread', label: 're-read' })] : []),
+              ...(p.top.back ? [make({ key: 'detail-back', label: '‹', color: TOKENS.cardInk })] : []),
+              make({ key: 'detail-x', label: '×', color: TOKENS.cardInk }),
+              ...(top.more ? [make({ key: 'detail-more', label: 'more', color: TOKENS.cardInk })] : []),
+              ...(p.top.reread ? [make({ key: 'detail-reread', label: 're-read', color: TOKENS.cardInk })] : []),
             ].flatMap((b) => [text(el, ' ', ground), b]),
             el.Box({ flexGrow: 1, width: 0, height: 1, overflow: 'hidden', children: [text(el, ' '.repeat(v.columns), { ...ground, wrap: 'truncate-end' })] }),
           ],
@@ -599,19 +601,177 @@ function featuresTab(el: Base, e: Entry, v: PaneView, make: Make): RenderNode[] 
   ]
 }
 
+/**
+ * Gear: the slots first (armour, shield, hands, attunement), each filled or
+ * free, where AC comes from, and any conflict; then every item, worn or held
+ * ones marked, each with `[ equip ]` or `[ unequip ]` (`eq-<row>`). The slots
+ * are the server's (`derived.equipment`, patch 21); the pane only draws them.
+ */
 function gearTab(el: Base, e: Entry, v: PaneView, make: Make): RenderNode[] {
   const s = e.sheet
+  const eq = e.derived?.equipment as
+    | { armor: string | null; shield: string | null; hands: { used: number; max: number; items: { name: string; hands: number }[] }; attunement: { used: number; max: number; items: string[] }; carried: string[]; conflicts: { key: string; message: string }[] }
+    | undefined
+  const pending = e.derivedPending
+  const out: RenderNode[] = []
+  const free = (el2: Base) => text(el2, 'free', { color: FAINT_TEXT })
+  const slotLine = (label: string, filled: RenderNode | null) => row(el, [dim(el, label.padEnd(10)), filled ?? free(el)])
+  const named = (n: string) => value(el, n, pending)
+  if (eq) {
+    const lines: RenderNode[] = [
+      slotLine('Armor', eq.armor ? named(eq.armor) : null),
+      slotLine('Shield', eq.shield ? named(eq.shield) : null),
+      row(el, [dim(el, `Hands ${eq.hands.used}/${eq.hands.max}`.padEnd(10)), ...(eq.hands.items.length ? [named(eq.hands.items.map((h) => (h.hands > 1 ? `${h.name} (both)` : h.name)).join(' · '))] : [free(el)])]),
+      row(el, [dim(el, `Attuned ${eq.attunement.used}/${eq.attunement.max}`.padEnd(10)), ...(eq.attunement.items.length ? [named(eq.attunement.items.join(' · '))] : [free(el)])]),
+    ]
+    const ac = e.derived?.ac as { value: number; from: string[] } | null | undefined
+    if (ac) lines.push(text(el, `AC ${ac.value} = ${ac.from.join(' + ')}${pending ? '?' : ''}`, { color: pending ? TOKENS.amber : FAINT_TEXT, wrap: 'wrap' }))
+    for (const c of eq.conflicts) lines.push(text(el, c.message, { color: TOKENS.amber, wrap: 'wrap' }))
+    out.push(section(el, heading(el, 'Worn and held'), lines))
+  }
+  const inSlot = new Set<string>(eq ? [eq.armor, eq.shield, ...eq.hands.items.map((h) => h.name)].filter((n): n is string => !!n) : [])
   // Each item's name as written: the server answers only a name it prints.
   // The key ends in the row, so an item listed twice draws two words.
   const items = (s.inventory ?? []).map((i: any, n: number) => {
     const key = `w:c:option:item|${i.name}||${n}`
-    const line = wordLine(el, word(el, v, make, key, i.name, {}, {}, true), (i.quantity !== 1 ? ` ×${i.quantity}` : '') + (i.attuned ? ' (attuned)' : '') + (i.note ? ` — ${i.note}` : ''))
+    const worn = inSlot.has(i.name) && i.equipped !== false
+    const tag = worn ? '▸ ' : '  '
+    const line = row(el, [
+      text(el, tag, { color: TOKENS.phosphor }),
+      wordLine(el, word(el, v, make, key, i.name, worn ? { bold: true } : {}, {}, true), (i.quantity !== 1 ? ` ×${i.quantity}` : '') + (i.attuned ? ' (attuned)' : '') + (i.note ? ` — ${i.note}` : '')),
+      make({ key: `eq-${n}`, label: worn ? 'unequip' : 'equip' }),
+    ])
     return hang(el, v, make, line, (a) => a === key)
   })
   const coins = Object.entries((s.currency ?? {}) as Record<string, number>)
     .filter(([, n]) => n > 0)
     .map(([k, n]) => `${n} ${k}`)
-  return [section(el, heading(el, 'Inventory'), items.length ? items : [md(el, ['_Nothing written._'])]), text(el, `Money  ${coins.join(', ') || 'none'}`, { bold: true })]
+  out.push(section(el, heading(el, 'Inventory'), items.length ? items : [md(el, ['_Nothing written._'])]), text(el, `Money  ${coins.join(', ') || 'none'}`, { bold: true }))
+  return out
+}
+
+/** A companion as the server derives it (patch 21), with the stored HP and status read off the sheet. */
+interface Pet {
+  index: number
+  id: string
+  name: string
+  group?: string
+  status: 'present' | 'dismissed' | 'down'
+  lifetime: { kind: string; spell?: string; hours?: number; elapsed_hours?: number }
+  official: boolean
+  max: number | null
+  current: number
+  temp: number
+  ac: number | null
+  speed: Record<string, number>
+  attacks: { name: string; attack?: string; damage?: string; damage_type?: string }[]
+  /** `heal`: the use's dice as the server works them out (Repair `2d8+3`); `self`: it can heal the companion itself. */
+  resources: { name: string; max: number | null; used: number; heal?: string; self?: boolean }[]
+  errors: string[]
+  origin: string
+}
+
+/** The sheet's companions, in its order: the server's numbers, the sheet's HP, uses and status (a tap's diff lands there first). */
+export function pets(e: Entry): Pet[] {
+  const stored = (e.sheet.companions ?? []) as any[]
+  const derived = (e.derived?.companions ?? []) as any[]
+  return stored.map((c, index) => {
+    const d = derived.find((x) => x.id === c.id) ?? derived[index] ?? {}
+    const hp = c.hp ?? {}
+    return {
+      index,
+      id: String(c.id ?? d.id ?? index),
+      name: String(c.name),
+      ...(c.group ? { group: String(c.group) } : {}),
+      status: (c.status ?? d.status ?? 'present') as Pet['status'],
+      lifetime: (c.lifetime ?? d.lifetime ?? { kind: 'permanent' }) as Pet['lifetime'],
+      official: d.official !== false,
+      max: typeof d.hp?.max === 'number' ? d.hp.max : null,
+      current: typeof hp.current === 'number' ? hp.current : typeof d.hp?.current === 'number' ? d.hp.current : 0,
+      temp: typeof hp.temp === 'number' ? hp.temp : 0,
+      ac: typeof d.ac === 'number' ? d.ac : null,
+      speed: d.speed ?? {},
+      attacks: d.attacks ?? [],
+      resources: ((c.resources ?? []) as any[]).map((r, j) => {
+        const dr = d.resources?.[j]
+        return {
+          name: String(r.name), used: Number(r.used ?? 0), max: typeof dr?.max === 'number' ? dr.max : typeof r.max === 'number' ? r.max : null,
+          ...(typeof dr?.heal === 'string' ? { heal: dr.heal, self: dr.heals_self === true } : {}),
+        }
+      }),
+      errors: d.errors ?? [],
+      origin: [c.creature?.name && c.creature.name !== c.name ? c.creature.name : null, c.origin?.name ?? c.origin?.kind].filter(Boolean).join(' · '),
+    }
+  })
+}
+
+/** `CONC Summon Beast`, `16/24 H`, `UNTIL RECAST`, `KEEPS`. */
+export function lifetimeBadge(l: Pet['lifetime']): string {
+  if (l.kind === 'concentration') return `CONC ${l.spell ?? ''}`.trim()
+  if (l.kind === 'timed') return `${l.elapsed_hours ?? 0}/${l.hours ?? '?'} H`
+  if (l.kind === 'until_replaced') return 'UNTIL RECAST'
+  return 'KEEPS'
+}
+
+/**
+ * Pets: every companion, grouped by its casting, each a card: name, status
+ * and lifetime, the unofficial reminder, the HP gauge, AC and speed, attacks,
+ * uses as pips, and its buttons (`comp-d-<i>` damage, `comp-h-<i>` heal,
+ * `comp-u-<i>-<j>` spend a use, `comp-s-<i>` dismiss or summon back,
+ * `comp-x-<i>` remove). Numbers the server has not re-derived since a write are amber.
+ */
+function companionsTab(el: Base, e: Entry, v: PaneView, make: Make): RenderNode[] {
+  const list = pets(e)
+  if (!list.length) return [dim(el, 'No companions. Ask Claude to add one: a summon, a familiar or steed, a creature the DM gives, or a custom one.')]
+  const pending = e.derivedPending
+  const out: RenderNode[] = []
+  const card = (p: Pet): RenderNode => {
+    const down = p.status === 'down'
+    const away = p.status === 'dismissed'
+    const head = row(el, [
+      text(el, p.name, { bold: !away, dimColor: away, ...(down ? { color: TOKENS.alert } : {}) }),
+      ...(down ? [text(el, 'DOWN', { color: TOKENS.alert, inverse: true })] : away ? [text(el, 'DISMISSED', { color: FAINT_TEXT })] : []),
+      text(el, lifetimeBadge(p.lifetime), { color: p.lifetime.kind === 'concentration' ? TOKENS.violet : FAINT_TEXT }),
+    ])
+    const lines: RenderNode[] = [head]
+    if (p.origin) lines.push(text(el, p.origin, { color: FAINT_TEXT, wrap: 'truncate-end' }))
+    if (!p.official) lines.push(text(el, 'not in the published rules for this character: get the DM\'s ok', { color: TOKENS.amber, wrap: 'wrap' }))
+    if (p.max !== null) {
+      const segs = hpSegments(p.current, p.max, p.temp, Math.max(4, Math.min(20, v.columns - 20)))
+      lines.push(row(el, [gaugeNode(el, v.surface, segs, away ? 'ink' : hpState(p.current, p.max), `HP ${p.current} of ${p.max}`), value(el, `${p.current}/${p.max}${p.temp ? ` +${p.temp}` : ''}`, pending)]))
+    } else lines.push(row(el, [dim(el, 'HP'), value(el, String(p.current), true)]))
+    const walk = p.speed.walk
+    const speeds = Object.entries(p.speed).filter(([k]) => k !== 'walk').map(([k, n]) => `${k} ${n}`)
+    lines.push(wrapRow(el, [stat(el, 'AC', p.ac === null ? '—' : String(p.ac), pending), ...(typeof walk === 'number' ? [stat(el, 'SPD', String(walk))] : []), ...speeds.map((sp) => dim(el, sp))]))
+    for (const a of p.attacks) {
+      lines.push(row(el, [text(el, a.name), ...(a.attack ? [stat(el, 'ATK', a.attack, pending)] : []), ...(a.damage ? [value(el, `${a.damage}${a.damage_type ? ' ' + a.damage_type : ''}`, pending)] : [])]))
+    }
+    for (const [j, r] of p.resources.entries()) {
+      const max = r.max ?? 0
+      const left = Math.max(0, max - r.used)
+      lines.push(row(el, [
+        dim(el, r.name),
+        pipsNode(el, v.surface, left, max, Math.max(1, max), 'phosphor', `${r.name} ${of(left, max)}`),
+        ...(r.heal ? [text(el, `heals ${r.heal}${r.self ? '' : ' (another)'}`, { color: FAINT_TEXT })] : []),
+        make({ key: `comp-u-${p.index}-${j}`, label: 'use' }),
+      ]))
+    }
+    for (const err of p.errors) lines.push(text(el, err, { color: TOKENS.amber, wrap: 'wrap' }))
+    lines.push(row(el, [
+      make({ key: `comp-d-${p.index}`, label: 'dmg' }),
+      make({ key: `comp-h-${p.index}`, label: 'heal' }),
+      ...(down ? [] : [make({ key: `comp-s-${p.index}`, label: away ? 'summon' : 'dismiss' })]),
+      make({ key: `comp-x-${p.index}`, label: 'remove' }),
+    ]))
+    return el.Box({ flexDirection: 'column', marginTop: 1, children: lines })
+  }
+  const groups = new Map<string, Pet[]>()
+  for (const p of list) groups.set(p.group ?? '', [...(groups.get(p.group ?? '') ?? []), p])
+  for (const [g, members] of groups) {
+    if (g) out.push(section(el, heading(el, `${g} · ${members.length}`), members.map(card)))
+    else out.push(...members.map(card))
+  }
+  return out
 }
 
 /** Notes: the DM's rules first, then who the character is, with unresolved names flagged beside them. */
@@ -642,6 +802,8 @@ function tabBody(el: Base, e: Entry, tab: TabId, v: PaneView, make: Make): Rende
       return featuresTab(el, e, v, make)
     case 'gear':
       return gearTab(el, e, v, make)
+    case 'companions':
+      return companionsTab(el, e, v, make)
     case 'notes':
       return notesTab(el, e)
     default:
@@ -770,8 +932,8 @@ function vitals(el: Base, v: PaneView, e: Entry): RenderNode {
 
   if (!pixel(v.surface)) {
     const ws = glance.map((g) => Math.max(g.label.length, g.s.length))
-    const lead = truth === 'seen' ? [text(el, '~', { color: TOKENS.faint })] : []
-    const digits = truth === 'never' ? [text(el, '—', { color: TOKENS.faint }), dim(el, `/${max}`)] : [text(el, `${current}/${max}`, { bold: true, ...(state === 'alert' || flash ? { inverse: true } : {}) })]
+    const lead = truth === 'seen' ? [text(el, '~', { color: FAINT_TEXT })] : []
+    const digits = truth === 'never' ? [text(el, '—', { color: FAINT_TEXT }), dim(el, `/${max}`)] : [text(el, `${current}/${max}`, { bold: true, ...(state === 'alert' || flash ? { inverse: true } : {}) })]
     const tempText = temp > 0 && truth !== 'never' ? `+${temp}` : ''
     const used = (truth === 'seen' ? 2 : 0) + (truth === 'never' ? 1 + `/${max}`.length : `${current}/${max}`.length) + 1 + (tempText ? tempText.length + 1 : 0)
     const n = Math.max(4, room(ws) - used)
@@ -836,7 +998,7 @@ function pipGlyphs(el: Base, left: number, max: number, flash: boolean): RenderN
     el,
     [
       ...(left ? [text(el, '●'.repeat(left), { color: TOKENS.phosphor, ...inv })] : []),
-      ...(max - left ? [text(el, '○'.repeat(max - left), { color: TOKENS.faint, ...inv })] : []),
+      ...(max - left ? [text(el, '○'.repeat(max - left), { color: FAINT_TEXT, ...inv })] : []),
     ],
     0,
   )
@@ -862,7 +1024,7 @@ function pipCells(el: Base, v: PaneView, e: Entry, make: Make): RenderNode[] {
     at([
       el.Box({
         flexShrink: 1,
-        children: [word(el, v, make, 'w:res:' + i, cut(r.label, w - 1 - (r.max > 10 ? `${r.left}/${r.max}`.length : r.max)), r.left ? {} : { color: TOKENS.faint }, { wrap: 'truncate-end' })],
+        children: [word(el, v, make, 'w:res:' + i, cut(r.label, w - 1 - (r.max > 10 ? `${r.left}/${r.max}`.length : r.max)), r.left ? {} : { color: FAINT_TEXT }, { wrap: 'truncate-end' })],
       }),
       el.Box({ flexShrink: 0, children: [pipGlyphs(el, r.left, r.max, flashes(v, new RegExp(`^/resources/${i}(/|$)`)))] }),
     ]),
@@ -876,7 +1038,7 @@ function pipCells(el: Base, v: PaneView, e: Entry, make: Make): RenderNode[] {
  * others are plain, dim Buttons with no hotkey.
  */
 function tabRule(el: Base, v: PaneView, make: Make): RenderNode {
-  const faint = (s: string) => el.Box({ flexShrink: 0, children: [text(el, s, { color: TOKENS.faint })] })
+  const faint = (s: string) => el.Box({ flexShrink: 0, children: [text(el, s, { color: FAINT_TEXT })] })
   const kids: RenderNode[] = [faint('─ ')]
   TABS.forEach((t, i) => {
     if (i) kids.push(faint(' ─ '))
@@ -887,7 +1049,7 @@ function tabRule(el: Base, v: PaneView, make: Make): RenderNode {
       }),
     )
   })
-  kids.push(fill(el, v.columns, { color: TOKENS.faint }, 1))
+  kids.push(fill(el, v.columns, { color: FAINT_TEXT }, 1))
   return el.Box({ flexDirection: 'row', marginTop: 1, overflow: 'hidden', children: kids })
 }
 
@@ -937,7 +1099,7 @@ export function paneTree(el: Els, v: PaneView): RenderElement {
   kids.push(...saveLines(el, v, e, make))
   kids.push(vitals(el, v, e))
   const speeds = otherSpeeds(e.sheet)
-  if (speeds.length) kids.push(text(el, speeds.join(' · '), { color: TOKENS.faint }))
+  if (speeds.length) kids.push(text(el, speeds.join(' · '), { color: FAINT_TEXT }))
 
   // The taps (register.ts): damage and heal at the left; at the right, undo while
   // there is a tap of this machine's to undo, then coins; the number field while one asks,
@@ -955,9 +1117,9 @@ export function paneTree(el: Els, v: PaneView): RenderElement {
   if (v.note) kids.push(text(el, v.note, { color: TOKENS.amber, wrap: 'wrap' }))
   if (v.tap && 'Input' in el && v.surface !== 'mobile') {
     kids.push(
-      el.Input({ key: 'tap-amount', label: `${v.tap.kind} · ${e.name}`, value: v.tap.text, autoFocus: true, submitLabel: 'apply', onSubmit: NOOP }),
+      el.Input({ key: 'tap-amount', label: `${v.tap.companion?.use?.label ?? v.tap.kind} · ${v.tap.companion?.name ?? e.name}`, value: v.tap.text, autoFocus: true, submitLabel: 'apply', onSubmit: NOOP }),
       // No number: the server raises the save and its DC after the write (patch 19).
-      ...(v.tap.kind === 'damage' && e.sheet.concentration ? [text(el, 'CON save due unless this drops them to 0', { color: TOKENS.violet, wrap: 'wrap' })] : []),
+      ...(v.tap.kind === 'damage' && !v.tap.companion && e.sheet.concentration ? [text(el, 'CON save due unless this drops them to 0', { color: TOKENS.violet, wrap: 'wrap' })] : []),
       goCancel(el, make, 'tap', 'apply'),
     )
   }
@@ -974,7 +1136,7 @@ export function paneTree(el: Els, v: PaneView): RenderElement {
   kids.push(tabRule(el, v, make), ...tabBody(el, e, v.tab, v, make))
   const off = v.reread && !('at' in v.reread) ? rereadText(v) : null
   const foot: RenderNode[] = [
-    ...(off ? [text(el, off, { color: TOKENS.faint, wrap: 'wrap' })] : []),
+    ...(off ? [text(el, off, { color: FAINT_TEXT, wrap: 'wrap' })] : []),
     ...(truth !== 'confirmed'
       ? [
           hang(
@@ -982,15 +1144,15 @@ export function paneTree(el: Els, v: PaneView): RenderElement {
             v,
             make,
             row(el, [
-              word(el, v, make, 'w:seen:' + e.id, `seen ${sameDay(e.readAt, v.now) ? clock(e.readAt) : day(e.readAt)}`, { color: TOKENS.faint }, {}, true),
-              text(el, '·', { color: TOKENS.faint }),
+              word(el, v, make, 'w:seen:' + e.id, `seen ${sameDay(e.readAt, v.now) ? clock(e.readAt) : day(e.readAt)}`, { color: FAINT_TEXT }, {}, true),
+              text(el, '·', { color: FAINT_TEXT }),
               make({ key: 'reread', label: 're-read', hotkey: 'e' }),
             ]),
             (a) => a === 'w:seen:' + e.id,
           ),
         ]
       : []),
-    ...(c && c.warnings > 0 && c.version === e.version ? [text(el, checkText(c), { color: TOKENS.faint, wrap: 'wrap' })] : []),
+    ...(c && c.warnings > 0 && c.version === e.version ? [text(el, checkText(c), { color: FAINT_TEXT, wrap: 'wrap' })] : []),
   ]
   if (foot.length) kids.push(el.Box({ flexDirection: 'column', marginTop: 1, children: foot }))
   kids.push(...openBox(el, v, make, (a) => a === 'w:seen:' + e.id))
@@ -1019,7 +1181,7 @@ function logRows(el: Base, v: PaneView, make: Make, from: number): RenderNode[] 
       columnGap: 1,
       alignItems: 'flex-start',
       children: [
-        el.Box({ width: CLOCK_W, flexShrink: 0, children: [text(el, clock(t.at), { color: TOKENS.faint })] }),
+        el.Box({ width: CLOCK_W, flexShrink: 0, children: [text(el, clock(t.at), { color: FAINT_TEXT })] }),
         el.Box({ flexGrow: 1, flexShrink: 1, children: [make({ key: 'log-' + i, label, plain: true })] }),
       ],
     })
@@ -1129,13 +1291,13 @@ function partyTree(el: Els, v: PaneView): RenderElement {
   const pcHp = (e: Entry): { gauge: RenderNode; value: RenderNode } => {
     const { current, max } = hpOf(e)
     const truth = hpTruth(e)
-    if (truth === 'never') return { gauge: gaugeNode(el, v.surface, noneSegments(), 'ink', `HP not on the sheet, max ${max}`), value: text(el, `—/${max}`, { color: TOKENS.faint }) }
+    if (truth === 'never') return { gauge: gaugeNode(el, v.surface, noneSegments(), 'ink', `HP not on the sheet, max ${max}`), value: text(el, `—/${max}`, { color: FAINT_TEXT }) }
     const hp = hpState(current, max)
     const look = { bold: true, ...(hp === 'alert' ? { inverse: true } : {}) }
     return {
       gauge: gaugeNode(el, v.surface, bandSegments(current, max), hp, `HP ${current} of ${max}` + (truth === 'seen' ? ', last seen' : '')),
       // A last-seen value is a word: its box says when it was seen, with the re-read.
-      value: truth === 'seen' ? row(el, [text(el, '~', { color: TOKENS.faint }), word(el, v, make, 'w:seen:' + e.id, `${current}/${max}`, look)], 0) : text(el, `${current}/${max}`, look),
+      value: truth === 'seen' ? row(el, [text(el, '~', { color: FAINT_TEXT }), word(el, v, make, 'w:seen:' + e.id, `${current}/${max}`, look)], 0) : text(el, `${current}/${max}`, look),
     }
   }
   /** A row's tags, as words: the sheet's conditions and exhaustion (amber), the DM's `req N`, `down`, `out`; last a PC's gold, dim, the first cut at the edge. */
@@ -1144,7 +1306,7 @@ function partyTree(el: Els, v: PaneView): RenderElement {
     ...(e && Array.isArray(e.sheet.requests) && e.sheet.requests.length ? [word(el, v, make, 'w:req:' + e.id, `req ${e.sheet.requests.length}`, { color: TOKENS.amber })] : []),
     ...(e?.sheet.concentration ? [concTag(el, e)] : []),
     ...(r?.down ? [text(el, 'down', { color: TOKENS.amber, inverse: true, bold: true })] : []),
-    ...(r?.out ? [text(el, 'out', { color: TOKENS.faint })] : []),
+    ...(r?.out ? [text(el, 'out', { color: FAINT_TEXT })] : []),
     ...(e ? [text(el, `${coinsOf(e.sheet, 'gp')} gp`, { dimColor: true })] : []),
   ]
   /** The open box under a PC's row, when one of its words (HP, a condition, `req`) holds it. */
@@ -1172,7 +1334,7 @@ function partyTree(el: Els, v: PaneView): RenderElement {
     })
   /** The grid's one faint header: `name AC hp in`, or `PP` out of a fight. */
   const header = (nameW: number, last: string) => {
-    const faint = (s: string) => text(el, s, { color: TOKENS.faint })
+    const faint = (s: string) => text(el, s, { color: FAINT_TEXT })
     return gridRow(nameW, null, [faint('name')], faint('AC'), { gauge: faint('hp'), value: null }, faint(last), [])
   }
   /** The name column: the longest name and room for `▸`, at most what the pane leaves after the other columns. */
@@ -1251,7 +1413,7 @@ function partyTree(el: Els, v: PaneView): RenderElement {
 
   if (!seen) kids.push(el.Box({ flexDirection: 'row', marginTop: 1, children: [reread] }))
   const readout = rereadText(v)
-  if (readout) kids.push(text(el, readout, { color: TOKENS.faint, wrap: 'wrap' }))
+  if (readout) kids.push(text(el, readout, { color: FAINT_TEXT, wrap: 'wrap' }))
   done()
   return col(el, kids)
 }

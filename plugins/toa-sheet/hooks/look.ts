@@ -25,7 +25,20 @@ export const TOKENS = {
   faint: '#6a6a6a',
   /** The hover preview's ground (T0093 Layer 3): the pane paints none, and the preview must cover the rows under it. */
   card: '#2b2b3c',
+  /**
+   * The words on that ground. It is dark on every theme, so its words carry their own
+   * light ink rather than the host's, which is near-black on a light theme.
+   */
+  cardInk: '#ededed',
+  cardDim: '#a8a8b8',
 } as const
+
+/**
+ * Faint words (a class line, `KEEPS`, `seen 13:19`, a readout): the host theme's own
+ * grey, a theme key, so it reads on a dark or a light ground. `TOKENS.faint` is a raw
+ * colour, kept for the pixel art, where a key cannot reach.
+ */
+export const FAINT_TEXT = 'inactive'
 
 /**
  * A receipt's indent in the transcript: the engine's rows carry a `⏺` and two

@@ -10,7 +10,8 @@
 import type { ClientSurface } from 'claude-code'
 import type { Cell } from './detail.ts'
 
-type CardProps = { depth: number; width: number; rows: Cell[][]; bg: string }
+/** `ink` and `dim`: the words' own colours on the card's dark ground, whatever the host's theme. */
+type CardProps = { depth: number; width: number; rows: Cell[][]; bg: string; ink: string; dim: string }
 type Span = { y: number; x0: number; x1: number; key: string }
 type Rec = { stop: (() => void) | null; on: string | null }
 
@@ -78,8 +79,7 @@ export default function Card(props: CardProps, s: ClientSurface<{ on: string | n
               <Text
                 {...bg}
                 {...(c.bold ? { bold: true } : {})}
-                {...(c.dimColor ? { dimColor: true } : {})}
-                {...(c.color ? { color: c.color } : {})}
+                color={c.color ?? (c.dimColor ? props.dim : props.ink)}
                 {...(c.key ? { underline: true, ...(c.key === on ? { inverse: true } : {}) } : {})}
               >
                 {c.text}

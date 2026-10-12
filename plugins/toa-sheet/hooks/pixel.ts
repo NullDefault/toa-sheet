@@ -6,12 +6,19 @@
 // Drawn at a fixed integer scale (2 or 4 CSS px per art px) with the markup's
 // own width and height, so nothing rescales a stroke. No frame, no panel, no
 // bloom: the Svg paints nothing but its pixels. Dark is the intended look; on
-// a light theme the pips vanish and the counts beside them stay.
+// a light theme the ink numerals turn dark (LIGHT) and the coloured ones keep their colour.
 
 import { hpSegments, noneSegments, segments, TOKENS, type HpState, type Segment, type Tone } from './look.ts'
 
 /** The Svg's own colours, beside look.ts's tokens: the Text tree uses the host's ink and `dimColor` instead. */
 const SVG = { ink: '#ededed', dim: '#9a9a9a', void: '#000000' } as const
+
+/**
+ * On a light ground the near-white ink vanishes (the AC, INIT, SPD and PP numerals), so the
+ * art carries its own swap: under `prefers-color-scheme: light` ink turns near-black and dim
+ * a mid grey. The colours stay as they were on a dark ground. Only in art that uses them.
+ */
+const LIGHT = `<style>@media (prefers-color-scheme: light){path[fill="${SVG.ink}"]{fill:#1c1c1c}path[fill="${SVG.dim}"]{fill:#5c5c5c}}</style>`
 
 /** The instrument's width budget in CSS px: the body of a 360 px Desktop pane. */
 const MAX_W = 300
@@ -81,6 +88,7 @@ export function painter() {
   }
   const svg = (w: number, h: number) =>
     `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${h}" width="${w}" height="${h}" shape-rendering="crispEdges">` +
+    (runs.some((r) => r.fill === SVG.ink || r.fill === SVG.dim) ? LIGHT : '') +
     runs.map((r) => `<path fill="${r.fill}" d="${r.d}"/>`).join('') +
     '</svg>'
   return { rect, text, svg }

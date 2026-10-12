@@ -55,7 +55,7 @@ import { askText, asHeard, candidates, cardOf, factsRow, HEARD_PATH, matches, no
 import { CONNECTOR, VAULT, receipt } from './receipt.ts'
 import { asApplied, asCheck, asGet, coinChange, entryAfterWrite, entryFromGet, matchEntry, moved, parseCoins, payloadOf, type Entry, type Save } from './sheet.ts'
 import { applyWrite, asManifest, asTableWrite, isSessionId, rosterRows, type TableLog } from './table.ts'
-import { bandTree, detailTree, heardBand, holding, hpOf, paneTree, receiptTree, RULES_KEY, slotRows, TABS, tabKey, tabOf, type Adding, type Ask, type LookView, type Reread, type Screen, type TabId, type Tap } from './view.ts'
+import { bandTree, detailTree, heardBand, holding, hpOf, paneTree, pets, receiptTree, RULES_KEY, slotRows, TABS, tabKey, tabOf, type Adding, type Ask, type LookView, type Reread, type Screen, type TabId, type Tap } from './view.ts'
 
 const PANE = 'toa-sheet'
 const KEY = 'sheet:' // one $.store key per character, so sessions never overwrite each other's characters
@@ -869,10 +869,93 @@ async function answerSave($: EngineInterface, key: string) {
   return write($, entry, { action: 'update', changes: { concentration: null } }, 'sheet pane: lost concentration', consent('lost · ' + entry.name, pane))
 }
 
+/**
+ * A pets-tab or gear-tab press. `comp-d`/`comp-h` open the number field for
+ * that companion; `comp-u` spends one use, `comp-s` dismisses or summons back,
+ * `comp-x` removes it (undo brings it back); `eq-<row>` equips or unequips an
+ * item. Each write is a JSON Patch that first tests the companion's id or the
+ * item's name at that index, so a stale pane cannot change the wrong one.
+ */
+async function petKey($: EngineInterface, key: string) {
+  const entry = focused()
+  if (!entry) return
+  const eq = /^eq-(\d+)$/.exec(key)
+  if (eq) {
+    const n = Number(eq[1])
+    const item = (entry.sheet.inventory ?? [])[n]
+    if (!item) return
+    const worn = inSlot(entry).has(String(item.name)) && item.equipped !== false
+    const changes = [{ op: 'test', path: `/inventory/${n}/name`, value: item.name }, { op: 'add', path: `/inventory/${n}/equipped`, value: !worn }]
+    return write($, entry, { action: 'update', changes }, `sheet pane: ${worn ? 'unequip' : 'equip'} ${item.name}`, consent(`${worn ? 'unequip' : 'equip'} · ${item.name}`, 'Sheet'))
+  }
+  const [, verb = '', i = '', j] = /^comp-([dhusx])-(\d+)(?:-(\d+))?$/.exec(key) ?? []
+  const p = pets(entry)[Number(i)]
+  if (!p) return
+  if (verb === 'd' || verb === 'h') {
+    tap = { kind: verb === 'd' ? 'damage' : 'heal', text: '', companion: { index: p.index, name: p.name } }
+    $.ui.invalidate('ui.render')
+    return focusOn($, 'tap-amount')
+  }
+  const test = { op: 'test', path: `/companions/${p.index}/id`, value: p.id }
+  if (verb === 'u') {
+    const r = p.resources[Number(j)]
+    if (!r) return
+    if (r.max !== null && r.used >= r.max) return say($, `no ${r.name} left`)
+    // A use that mends the companion (Repair): the number field takes the roll; apply spends the use and heals.
+    if (r.heal && r.self) {
+      tap = { kind: 'heal', text: '', companion: { index: p.index, name: p.name, use: { index: Number(j), label: `${r.name} ${r.heal}` } } }
+      $.ui.invalidate('ui.render')
+      return focusOn($, 'tap-amount')
+    }
+    const changes = [test, { op: 'replace', path: `/companions/${p.index}/resources/${j}/used`, value: r.used + 1 }]
+    await write($, entry, { action: 'update', changes }, `sheet pane: ${p.name} ${r.name}`, consent(`use · ${p.name} · ${r.name}`, 'Sheet'))
+    // A heal for another creature: the use is spent here, the roll goes to whoever it heals.
+    if (r.heal) say($, `${r.name}: the target regains ${r.heal}`)
+    return
+  }
+  if (verb === 's') {
+    const to = p.status === 'dismissed' ? 'present' : 'dismissed'
+    const changes = [test, { op: 'add', path: `/companions/${p.index}/status`, value: to }]
+    return write($, entry, { action: 'update', changes }, `sheet pane: ${to === 'present' ? 'summon' : 'dismiss'} ${p.name}`, consent(`${to === 'present' ? 'summon' : 'dismiss'} · ${p.name}`, 'Sheet'))
+  }
+  const changes = [test, { op: 'remove', path: `/companions/${p.index}` }]
+  return write($, entry, { action: 'update', changes }, `sheet pane: remove ${p.name}`, consent(`remove · ${p.name}`, 'Sheet'))
+}
+
+/** Item names in the server's slots (armour, shield, hands). */
+function inSlot(entry: Entry): Set<string> {
+  const eq = entry.derived?.equipment
+  if (!eq) return new Set()
+  return new Set([eq.armor, eq.shield, ...((eq.hands?.items ?? []) as { name: string }[]).map((h) => h.name)].filter((n): n is string => typeof n === 'string'))
+}
+
+/** A companion's damage or healing: temp HP first, then HP; healing up to its derived max. The server downs or removes it at 0. */
+async function petHp($: EngineInterface, entry: Entry, n: number, typed: string) {
+  const c = tap?.companion
+  const p = c ? pets(entry)[c.index] : undefined
+  if (!tap || !c || !p || p.name !== c.name) return say($, 'that companion is gone')
+  const damage = tap.kind === 'damage'
+  const max = p.max ?? Infinity
+  const use = c.use ? p.resources[c.use.index] : undefined
+  if (c.use && (!use || (use.max !== null && use.used >= use.max))) return say($, `no ${use?.name ?? 'uses'} left`)
+  if (n === 0 || (!damage && !use && p.current >= max)) return say($, 'nothing to change')
+  const t = damage ? Math.min(p.temp, n) : 0
+  const hp = damage ? { current: Math.max(0, p.current - (n - t)), temp: p.temp - t } : { current: Math.min(max, p.current + n), temp: p.temp }
+  const changes = [
+    { op: 'test', path: `/companions/${p.index}/id`, value: p.id },
+    { op: 'add', path: `/companions/${p.index}/hp`, value: hp },
+    ...(use ? [{ op: 'replace', path: `/companions/${p.index}/resources/${c.use!.index}/used`, value: use.used + 1 }] : []),
+  ]
+  const label = c.use?.label ?? tap.kind
+  const said = `The user entered "${typed.trim()}" in "${label} · ${p.name}" on the Sheet pane and pressed apply`
+  return write($, entry, { action: 'update', changes }, `sheet pane: ${p.name} ${use ? use.name + ' ' : ''}${damage ? '−' : '+'}${n} HP`, said)
+}
+
 /** The number field's `n`: damage spends temp HP first, then HP down to 0; healing raises HP up to the max the pane draws. */
 async function hp($: EngineInterface, n: number, typed: string) {
   const entry = focused()
   if (!entry || !tap) return
+  if (tap.companion) return petHp($, entry, n, typed)
   const { current, max, temp } = hpOf(entry)
   const damage = tap.kind === 'damage'
   if (n === 0 || (damage && current <= 0 && temp <= 0) || (!damage && current >= max)) return say($, 'nothing to change')
@@ -1027,12 +1110,20 @@ async function watch($: EngineInterface, e: any, result: unknown) {
     return update($, { ...known, check: counts })
   }
   const wrote = asApplied(p.data)
-  const old = wrote ? sheets.get(wrote.character) : undefined
+  const request = e.request ?? e.input?.request ?? {}
+  let old = wrote ? sheets.get(wrote.character) : undefined
+  if (wrote && !old && request.action === 'create') {
+    // A new sheet: nothing is cached, and its diff runs from nothing to the whole sheet, so the
+    // copy is built from it; derived waits for the first get (live sync fetches it when allowed).
+    old = {
+      id: wrote.character, name: wrote.name ?? wrote.character, owner: null, version: wrote.version - 1, sheet: {}, derived: null,
+      unresolved: [], readAt: now, seenAt: now, server: m[1] ?? '', refreshing: false, derivedPending: true, fromStore: false, drift: false, last: null,
+    }
+  }
   if (!wrote || !old) return
   // A write that touches the field answers its saves; one that raises a save adds it.
   if (wrote.diff.some((d) => /^\/concentration(\/|$)/.test(d.path))) saves.delete(old.id)
   if (wrote.save) saves.set(old.id, [...(saves.get(old.id) ?? []), wrote.save])
-  const request = e.request ?? e.input?.request ?? {}
   flash = { id: old.id, paths: wrote.diff.map((d) => d.path), until: now + FLASH_MS }
   $.clock.after(FLASH_MS, () => $.ui.invalidate('ui.render'))
   await remember($, entryAfterWrite(old, wrote, typeof request.reason === 'string' ? request.reason : '', now))
@@ -1484,6 +1575,10 @@ export function register(on: On) {
         await act($, id)
       } else if (id.startsWith('tap-') || id.startsWith('slot-')) {
         await tapKey($, id)
+      } else if (/^comp-[dhusx]-\d+(-\d+)?$/.test(id) || /^eq-\d+$/.test(id)) {
+        // Labels change (dismiss/summon, equip/unequip), so the press is taken.
+        await petKey($, id)
+        return { element: id }
       } else if (/^conc-\d+$/.test(id)) {
         // Its label changes (CONC, HOLDING), so its handle retires: the press is taken.
         await concentrate($, id)
