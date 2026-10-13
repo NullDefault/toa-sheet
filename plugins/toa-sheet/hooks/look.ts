@@ -6,8 +6,9 @@
 //
 // The screen is the terminal: the pane paints no background and sets no theme.
 // Ink is the host's foreground (no `color`), dim is `dimColor`; only the raw
-// colours below are set. Dark is the intended look; a light theme keeps the
-// words and loses the colour.
+// colours below are set. Dark is the intended look; on a light theme
+// (`useLight`, from the host's `theme` setting) the accents swap to darker
+// shades of the same hues, so they read on a white ground.
 
 import type { TextProps } from 'claude-code'
 
@@ -16,7 +17,7 @@ import type { TextProps } from 'claude-code'
  * owner chose (factory T0037, `B-workbench-green.png`), which Studio
  * (`journal/`) shares, so the two tools have one green.
  */
-export const TOKENS = {
+const DARK = {
   phosphor: '#4af626',
   amber: '#f0a020',
   alert: '#ff3b30',
@@ -31,7 +32,34 @@ export const TOKENS = {
    */
   cardInk: '#ededed',
   cardDim: '#a8a8b8',
-} as const
+}
+
+/**
+ * The light theme's accents: the same hues, dark enough for 4.5:1 on white.
+ * The neon originals wash out on a light ground (owner, 2026-10-12: "light
+ * mode for the d&d pane looks bad, hard to read"). The card keeps its own dark
+ * ground and ink on every theme.
+ */
+const LIGHT: typeof DARK = {
+  ...DARK,
+  phosphor: '#1a7f0e',
+  amber: '#9a5700',
+  alert: '#c4231b',
+  cyan: '#00728a',
+  violet: '#6a3fd6',
+  faint: '#767676',
+}
+
+/** The colours in use: dark's until `useLight` says the host's theme is light. */
+export let TOKENS: Readonly<typeof DARK> = DARK
+
+/** Picks the accents for the host's theme; true for any `light*` theme. */
+export function useLight(light: boolean): void {
+  TOKENS = light ? LIGHT : DARK
+}
+
+/** Whether a `theme` setting value is one of the light themes (`light`, `light-daltonized`, `light-ansi`). */
+export const isLightTheme = (value: unknown): boolean => typeof value === 'string' && value.startsWith('light')
 
 /**
  * Faint words (a class line, `KEEPS`, `seen 13:19`, a readout): the host theme's own

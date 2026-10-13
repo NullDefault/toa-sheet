@@ -50,7 +50,7 @@ import type { EngineInterface, MatchedHook, On, RenderElement, Timer, ToolCallAr
 import { actionGroups } from './actions.ts'
 import { fold, lastPack, live, nextPack, parsePacks, sessionPacks, summary, undoTarget, type Event, type Fight, type Op, type Pack } from './fight.ts'
 import { detailAt, fetchPreview, pressWord, wordCard, type Content, type Detail, type Preview } from './detail.ts'
-import { FLASH_MS } from './look.ts'
+import { FLASH_MS, isLightTheme, useLight } from './look.ts'
 import { askText, asHeard, candidates, cardOf, factsRow, HEARD_PATH, matches, norm, type Candidate, type Heard } from './lookup.ts'
 import { CONNECTOR, VAULT, receipt } from './receipt.ts'
 import { asApplied, asCheck, asGet, coinChange, entryAfterWrite, entryFromGet, matchEntry, moved, parseCoins, payloadOf, type Entry, type Save } from './sheet.ts'
@@ -1255,12 +1255,23 @@ function stopSync() {
   timer = null
 }
 
+/** Follows the host's theme: on a light one the pane's accents swap to their darker shades (look.ts). */
+async function syncTheme($: EngineInterface): Promise<void> {
+  try {
+    const row = (await $.config.list()).find((r) => r.key === 'theme')
+    useLight(isLightTheme(row?.value))
+  } catch (err) {
+    $.ui.log('the theme was not read: ' + message(err))
+  }
+}
+
 export function register(on: On) {
   on('session.start', async ($, e, next) => {
     heardPoll?.cancel()
     heardPoll = null
     heard = null
     await loadStore($)
+    await syncTheme($)
     try {
       await $.command.register({
         name: 'sheet',
@@ -1283,6 +1294,14 @@ export function register(on: On) {
     }
     return next(e)
   })
+
+  // A theme change redraws the pane in the new theme's accents.
+  on('config.set', { key: 'theme' }, async ($, e, next) => {
+    const result = await next(e)
+    await syncTheme($)
+    $.ui.invalidate('ui.render')
+    return result
+  }).catch(($, e, next) => next(e))
 
   // The connector's sheet tools under any server name (a claude.ai uuid, or the name it was added with).
   on('tool.call', { tool: /^mcp__.+__sheet_(read|write)$/ }, async ($, e, next) => {
