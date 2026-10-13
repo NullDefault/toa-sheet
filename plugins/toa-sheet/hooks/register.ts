@@ -1018,7 +1018,6 @@ async function write($: EngineInterface, entry: Entry, body: Record<string, unkn
   const from = entry.version
   writing = true
   try {
-    if (!(await $.tool.list()).some((t) => t.name === tool)) return say($, 'no sheet_write tool in this session')
     // The name is built at run time, so it is no literal the declarations know.
     const r = await $.tool.call({ tool, request: { ...body, character: entry.id, base_version: from, reason }, apply: true, consent: said } as ToolCallArgs)
     if ('deny' in r) {
