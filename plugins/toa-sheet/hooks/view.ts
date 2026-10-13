@@ -89,6 +89,16 @@ export type Screen = 'party' | 'sheet' | 'packs' | 'look' | 'card' | 'log' | 'pa
 /** The look as drawn: the field's text and its matches, or the open card, its fetch and its page. */
 export type LookView = { text: string; matches: Candidate[]; card: Card | null; loading: boolean; error: string | null; page: number }
 
+export type GroupView = {
+  source: 'note' | 'prep' | 'args'
+  from: string | null
+  warning: string | null
+  ids: Set<string>
+  unmatched: string[]
+  all: boolean
+  payees: string[]
+}
+
 export interface PaneView {
   screen: Screen
   /** There is a screen under this one: `[ ‹ back ]` is drawn. */
@@ -145,6 +155,12 @@ export interface PaneView {
   heard: Heard | null
   /** The party's open split field, its text so far; else null. */
   split: string | null
+  /**
+   * Tonight's group (roster.ts), or null when the vault and `/party` name
+   * nobody: where it came from, the sheets it names, the names no sheet
+   * answers to, `[ all ]` pressed, and who `[ split gold ]` pays.
+   */
+  group: GroupView | null
   /** The open detail box (T0093): the word it hangs from; else null. */
   detail: Detail | null
   /** The hover preview (T0093 Layer 3), shown or pinned; else null. */
@@ -1246,9 +1262,11 @@ function partyTree(el: Els, v: PaneView): RenderElement {
   // what is entered. The phone's table has no Input (Elements['mobile']), but
   // resolve hands it one that draws an empty Box, so the surface is asked too.
   const inputs = 'Input' in el && v.surface !== 'mobile'
+  const payees = v.group?.payees ?? v.rows.map((e) => e.name)
   if (inputs && v.split !== null) {
     kids.push(
       (el as Elements['terminal']).Input({ key: 'split-amount', label: 'split gold · party', value: v.split, autoFocus: true, submitLabel: 'apply', onSubmit: NOOP }),
+      text(el, 'pays ' + (payees.length ? payees.join(', ') : 'nobody'), { dimColor: true, wrap: 'wrap' }),
       goCancel(el, make, 'split', 'apply'),
     )
   }
@@ -1348,11 +1366,29 @@ function partyTree(el: Els, v: PaneView): RenderElement {
   const seen = v.rows.some((e) => hpTruth(e) === 'seen')
   const sectionRule = (label: string, first: boolean) => (seen && first ? ruleWith(el, label, v.columns, reread) : ruleLine(el, label, v.columns))
 
+  // Tonight's group: the rows it names, unless `[ all ]`; a fight's order keeps every row it has.
+  const g = v.group
+  const shown = g && !g.all ? v.rows.filter((e) => g.ids.has(e.id)) : v.rows
+  const toggle = g ? make({ key: 'group-toggle', label: g.all ? 'group' : 'all' }) : null
+  const groupLines = (): RenderNode[] =>
+    !g
+      ? []
+      : [
+          dim(el, (g.all ? `ALL ${v.rows.length} · GROUP ${g.ids.size}` : `GROUP ${g.ids.size} OF ${v.rows.length}`) + ` · ${g.from ?? 'typed after /party'}`),
+          ...(g.unmatched.length ? [text(el, 'no sheet for ' + g.unmatched.join(', '), { color: TOKENS.amber, wrap: 'wrap' })] : []),
+          ...(g.warning ? [text(el, g.warning, { color: TOKENS.amber, wrap: 'wrap' })] : []),
+        ]
+  /** The first section rule, with `[ all ]` / `[ group ]` at its end beside the re-read when it sits there. */
+  const firstRule = (label: string) => {
+    if (!toggle) return sectionRule(label, true)
+    const end = seen ? el.Box({ flexDirection: 'row', columnGap: 1, children: [toggle, reread] }) : toggle
+    return ruleWith(el, label, v.columns, end)
+  }
   const fought = new Set(f?.rows.map((r) => r.id) ?? [])
-  const party = v.rows.filter((e) => !fought.has(e.id))
+  const party = shown.filter((e) => !fought.has(e.id))
   if (f) {
     // The PCs appear only here: those not yet in the fight under the order, each with its `[ init ]`.
-    kids.push(sectionRule('Order', true))
+    kids.push(firstRule('Order'), ...groupLines())
     const order = orderRows(f)
     const deck = onDeck(f)
     const sheetOf = (r: Row) => (r.side === 'pc' ? v.rows.find((e) => e.id === r.id) : undefined)
@@ -1387,10 +1423,10 @@ function partyTree(el: Els, v: PaneView): RenderElement {
       kids.push(...askFor(e.id, 5))
     }
   } else {
-    kids.push(sectionRule('Party', true))
-    const nameW = nameWidth(v.rows.map((e) => e.name))
-    if (v.rows.length) kids.push(header(nameW, 'PP'))
-    for (const e of v.rows) {
+    kids.push(firstRule('Party'), ...groupLines())
+    const nameW = nameWidth(shown.map((e) => e.name))
+    if (shown.length) kids.push(header(nameW, 'PP'))
+    for (const e of shown) {
       const ac = text(el, String(e.sheet.ac?.value ?? '?'), { bold: true })
       const pp = value(el, String(e.derived?.passive_perception ?? '?'), e.derivedPending || !e.derived)
       kids.push(gridRow(nameW, null, nameCell(e.id, fit(e.name, nameW - 1)), ac, pcHp(e), pp, tagsOf(e, null)), ...rowBox(e))

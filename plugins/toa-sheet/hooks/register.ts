@@ -43,7 +43,7 @@
 // and draws its newest names as the HEARD row and the band's heard line. Its text
 // leaves the Mac only in an ask from the party pane, on a press.
 //
-// Mods API calls: $.ui, $.store, $.command, $.clock, $.tool, $.fs.read, $.prompt.submit only.
+// Mods API calls: $.ui, $.store, $.command, $.clock, $.tool, $.fs.read, $.fs.list, $.prompt.submit only.
 // Every call lives in this file; sheet.ts, table.ts, look.ts, lookup.ts, receipt.ts and view.ts are pure.
 
 import type { EngineInterface, MatchedHook, On, RenderElement, Timer, ToolCallArgs } from 'claude-code'
@@ -55,6 +55,7 @@ import { askText, asHeard, candidates, cardOf, factsRow, HEARD_PATH, matches, no
 import { CONNECTOR, VAULT, receipt } from './receipt.ts'
 import { asApplied, asCheck, asGet, coinChange, entryAfterWrite, entryFromGet, matchEntry, moved, parseCoins, payloadOf, type Entry, type Save } from './sheet.ts'
 import { applyWrite, asManifest, asTableWrite, isSessionId, rosterRows, type TableLog } from './table.ts'
+import { frontmatter, listOf, matchGroup, pickRoster, shownRows, type PcNote, type Roster } from './roster.ts'
 import { bandTree, detailTree, heardBand, holding, hpOf, paneTree, pets, receiptTree, RULES_KEY, slotRows, TABS, tabKey, tabOf, type Adding, type Ask, type LookView, type Reread, type Screen, type TabId, type Tap } from './view.ts'
 
 const PANE = 'toa-sheet'
@@ -121,6 +122,10 @@ let lastTap: { id: string; from: number; to: number } | null = null
 // so memory only. Only this session's writes pass the watcher, so a pane sees its own session's saves.
 const saves = new Map<string, Save[]>()
 let split: string | null = null // the party's open `[ split gold ]` field, its text so far
+// Tonight's group (roster.ts): read on `/party`, matched to the cached sheets at each draw. Never stored.
+let roster: Roster | null = null
+let pcNotes: PcNote[] = []
+let showAll = false // `[ all ]` on the PARTY rule: every sheet, the group aside
 // The look (T0085), never stored: the pane it was opened from, the field's text
 // (kept for Back from a card), the open card's candidate, its fetch and page.
 type Look = { pane: 'Party' | 'Sheet'; text: string; cand: Candidate | null; loading: boolean; error: string | null; page: number }
@@ -483,6 +488,53 @@ async function act($: EngineInterface, key: string) {
   if (key === 'act-k') return apply($, { op: 'down', row: id, name: nameOf(id), value: !row?.down })
   if (key === 'act-t') return row ? turn($, { op: 'point', row: id }, 'turn') : say($, 'not in the fight')
 }
+
+const SESSIONS = 'Sessions' // the session notes, Sxx.md, for `present:`
+const PREP = 'Prep' // the prep docs, for `sessions:` and `party:`
+const PCS = 'Lore/Party' // the PC notes, for `aliases:`
+
+/** A file's text, or null when it cannot be read. */
+async function readOr($: EngineInterface, path: string): Promise<string | null> {
+  try {
+    return await $.fs.read(path)
+  } catch {
+    return null
+  }
+}
+
+/** The `.md` files directly in `dir`, by path; none when it cannot be listed. */
+async function mdFiles($: EngineInterface, dir: string): Promise<{ path: string; md: string }[]> {
+  let names: string[]
+  try {
+    names = (await $.fs.list(dir)).filter((f) => f.kind === 'file' && f.name.endsWith('.md')).map((f) => f.name)
+  } catch {
+    return []
+  }
+  const out: { path: string; md: string }[] = []
+  for (const name of names) {
+    const md = await readOr($, `${dir}/${name}`)
+    if (md !== null) out.push({ path: `${dir}/${name}`, md })
+  }
+  return out
+}
+
+/** Tonight's group for the session on show (roster.ts `pickRoster`), and the PC notes' aliases to match it with. */
+async function readRoster($: EngineInterface, typed: string[]) {
+  showAll = false
+  if (!session) {
+    roster = typed.length ? { source: 'args', from: null, names: typed, warning: null } : null
+  } else {
+    const path = `${SESSIONS}/${session}.md`
+    const md = await readOr($, path)
+    roster = pickRoster(md === null ? null : { path, md }, await mdFiles($, PREP), typed, session)
+  }
+  pcNotes = roster ? (await mdFiles($, PCS)).map((f) => ({ name: f.path.slice(PCS.length + 1, -3), aliases: listOf(frontmatter(f.md).aliases) })) : []
+}
+
+/** The group as drawn: the cached sheets it names and the names none does; null with no roster. */
+const groupNow = () => (roster ? matchGroup(rosterRows([...sheets.values()]), roster.names, pcNotes) : null)
+/** The party view's rows: the group's unless `[ all ]`. */
+const partyRows = () => shownRows(rosterRows([...sheets.values()]), groupNow(), showAll)
 
 /** Read Prep/Fights.md fresh, and every stored fight's log, for `[ next ]`. */
 async function readPackets($: EngineInterface) {
@@ -981,7 +1033,7 @@ async function coins($: EngineInterface, typed: string) {
 }
 
 /**
- * `[ split gold ]`'s amount: paid out evenly to every cached PC, one write at a
+ * `[ split gold ]`'s amount: paid out evenly to the PCs the party view shows (tonight's group, or all with `[ all ]`), one write at a
  * time, the remainder named. A refusal stops it, naming who was paid; each
  * write is its own, so `[ undo ]` on a sheet undoes only the last.
  */
@@ -989,7 +1041,7 @@ async function splitGold($: EngineInterface, typed: string) {
   if (typed.startsWith('-')) return say($, 'split pays out; spend per row')
   const c = parseCoins(typed.startsWith('+') ? typed : '+' + typed)
   if ('refused' in c) return say($, c.refused)
-  const pcs = rosterRows([...sheets.values()])
+  const pcs = partyRows()
   const each = Math.floor(c.delta / Math.max(1, pcs.length))
   if (each < 1) return say($, pcs.length ? `${c.delta} ${c.coin} is less than 1 each` : 'no sheets to pay')
   const said = `The user entered "${typed}" in "split gold · party" on the Party pane and pressed apply`
@@ -1003,7 +1055,7 @@ async function splitGold($: EngineInterface, typed: string) {
     paid.push(pc.name)
   }
   split = null
-  say($, `${each} ${c.coin} each · ${c.delta - each * pcs.length} ${c.coin} left over`)
+  say($, `${each} ${c.coin} each to ${pcs.map((p) => p.name).join(', ')} · ${c.delta - each * pcs.length} ${c.coin} left over`)
   await syncEsc($)
   return park($)
 }
@@ -1352,11 +1404,15 @@ export function register(on: On) {
   // `/party [S04]`: the party view, drawn from the cache at once, then re-read and kept current while it is open
   // where sheet_read is allowed (refresh's `$.tool.check`); elsewhere only `[ re-read ]`, or a turn into a new round, re-reads.
   on('command.run', { command: 'party' }, async ($, e) => {
-    const arg = String(e.args ?? '').trim().toUpperCase()
-    if (isSessionId(arg)) {
-      session = arg
+    // `/party S05 nux diego gout`: the session, then the names to use when the vault names nobody.
+    const words = String(e.args ?? '').trim().split(/\s+/).filter(Boolean)
+    const first = words[0]?.toUpperCase() ?? ''
+    if (isSessionId(first)) {
+      session = first
+      words.shift()
       await $.store.set(SESSION, session)
     }
+    await readRoster($, words)
     await readPackets($)
     screens = ['party']
     leave()
@@ -1442,6 +1498,10 @@ export function register(on: On) {
       saves,
       heard,
       split,
+      group: roster && (() => {
+        const g = groupNow()!
+        return { source: roster.source, from: roster.from, warning: roster.warning, ids: g.ids, unmatched: g.unmatched, all: showAll, payees: partyRows().map((r) => r.name) }
+      })(),
       detail,
       preview: previewView(rows, entry, now),
     })
@@ -1613,6 +1673,10 @@ export function register(on: On) {
         await apply($, 'undo')
       } else if (id === 'reread') {
         if (await refresh($, consent('re-read', top() === 'sheet' ? 'Sheet' : 'Party'), true, true)) await startSync($)
+        return { element: id }
+      } else if (id === 'group-toggle') {
+        showAll = !showAll
+        $.ui.invalidate('ui.render')
         return { element: id }
       } else if (id === 'split') {
         split = split === null ? '' : null
